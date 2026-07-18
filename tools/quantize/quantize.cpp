@@ -103,6 +103,11 @@ static constexpr int     SELECTOR_N_SEQ_AUTO_MAX = 32;
 static constexpr double  SELECTOR_N_SEQ_CUDA_RESERVE_MIN_GIB = 4.0;
 static constexpr double  SELECTOR_N_SEQ_CUDA_RESERVE_MAX_GIB = 16.0;
 static constexpr double  SELECTOR_N_SEQ_CUDA_RESERVE_FRACTION = 0.20;
+// Headroom multiplier applied to the per-seq logits buffer when budgeting the
+// n_seq-scaled graph compute buffer on multi-GPU. The exact compute buffer size
+// is hard to model portably, so this stays conservative; the context-creation
+// retry safety net guarantees a fit regardless of the estimate.
+static constexpr double  SELECTOR_MULTIGPU_COMPUTE_FACTOR = 2.5;
 static constexpr double  SELECTOR_MXFP6_PPL_ABS_TOL = 2e-4;
 static constexpr double  SELECTOR_MXFP6_PPL_REL_TOL = 0.01;
 static constexpr double  SELECTOR_MXFP6_MEAN_KLD_ABS_TOL = 7.5e-5;
@@ -372,6 +377,33 @@ static bool selector_reset_cuda_device(int device) {
     (void) device;
     return false;
 #endif
+}
+
+// Maximum n_seq that fits the tightest per-device VRAM budget on a multi-GPU
+// setup. With n_gpu_layers covering all layers, llama.cpp splits the model
+// across devices, so each device keeps ~model_gib/n_devices of weights and must
+// still fit the graph compute buffer, which scales linearly with n_seq. Returns
+// INT_MAX when there is no multi-GPU constraint (single device or missing info),
+// so callers can simply take the min with their current n_seq.
+static int selector_multi_gpu_n_seq_cap(
+        int n_devices,
+        double min_free_gib,
+        double model_gib,
+        double logits_gib_per_seq,
+        double compute_factor) {
+    if (n_devices <= 1 || min_free_gib <= 0.0 || logits_gib_per_seq <= 0.0) {
+        return std::numeric_limits<int>::max();
+    }
+    const double model_per_device_gib = model_gib / (double) n_devices;
+    const double available_gib = min_free_gib - model_per_device_gib;
+    if (available_gib <= 0.0) {
+        return 1;
+    }
+    const double scalable_per_seq_gib = logits_gib_per_seq * compute_factor;
+    if (scalable_per_seq_gib <= 0.0) {
+        return 1;
+    }
+    return std::max(1, (int) std::floor(available_gib / scalable_per_seq_gib));
 }
 
 struct selector_rank_config {
@@ -7642,26 +7674,44 @@ static bool selector_choose_policy(
     bool selector_cuda_memory_known = false;
     double selector_cuda_free_gib = 0.0;
     double selector_cuda_total_gib = 0.0;
+    double selector_cuda_min_free_gib = 0.0;
 #if defined(GGML_USE_CUDA)
     if (run_stageb_eval && ggml_backend_cuda_get_device_count() > 0) {
-        size_t cuda_free = 0;
-        size_t cuda_total = 0;
-        ggml_backend_cuda_get_device_memory(0, &cuda_free, &cuda_total);
-        const bool reset_before_eval = true;
-        if (reset_before_eval && cuda_total > 0 && cuda_free < cuda_total / 2) {
-            fprintf(stderr,
-                "%s: selector stage-b resetting CUDA device 0 before n_seq sizing to release encoder/proxy workspaces (free=%.2f GiB total=%.2f GiB)\n",
-                __func__,
-                (double) cuda_free / (1024.0 * 1024.0 * 1024.0),
-                (double) cuda_total / (1024.0 * 1024.0 * 1024.0));
-            if (selector_reset_cuda_device(0)) {
-                ggml_backend_cuda_get_device_memory(0, &cuda_free, &cuda_total);
+        const int cuda_device_count = ggml_backend_cuda_get_device_count();
+        // Account for every visible device. With multiple GPUs the model is split
+        // across them, so the tightest per-device headroom bounds n_seq; device 0
+        // remains the reference for the existing logits budget and logging.
+        double min_free_gib = 0.0;
+        bool have_free = false;
+        for (int d = 0; d < cuda_device_count; ++d) {
+            size_t cuda_free = 0;
+            size_t cuda_total = 0;
+            ggml_backend_cuda_get_device_memory(d, &cuda_free, &cuda_total);
+            if (d == 0 && cuda_total > 0 && cuda_free < cuda_total / 2) {
+                fprintf(stderr,
+                    "%s: selector stage-b resetting CUDA device 0 before n_seq sizing to release encoder/proxy workspaces (free=%.2f GiB total=%.2f GiB)\n",
+                    __func__,
+                    (double) cuda_free / (1024.0 * 1024.0 * 1024.0),
+                    (double) cuda_total / (1024.0 * 1024.0 * 1024.0));
+                if (selector_reset_cuda_device(0)) {
+                    ggml_backend_cuda_get_device_memory(0, &cuda_free, &cuda_total);
+                }
+            }
+            if (cuda_total > 0) {
+                const double free_gib = (double) cuda_free / (1024.0 * 1024.0 * 1024.0);
+                if (!have_free || free_gib < min_free_gib) {
+                    min_free_gib = free_gib;
+                    have_free = true;
+                }
+                if (d == 0) {
+                    selector_cuda_memory_known = true;
+                    selector_cuda_free_gib = free_gib;
+                    selector_cuda_total_gib = (double) cuda_total / (1024.0 * 1024.0 * 1024.0);
+                }
             }
         }
-        if (cuda_total > 0) {
-            selector_cuda_memory_known = true;
-            selector_cuda_free_gib = (double) cuda_free / (1024.0 * 1024.0 * 1024.0);
-            selector_cuda_total_gib = (double) cuda_total / (1024.0 * 1024.0 * 1024.0);
+        if (have_free) {
+            selector_cuda_min_free_gib = min_free_gib;
         }
     }
 #endif
@@ -7706,6 +7756,39 @@ static bool selector_choose_policy(
             }
         } else {
             selector_n_seq = std::max(1, std::min({ max_n_seq_by_logits, selector_n_seq_auto_cap, kld.n_chunk }));
+#if defined(GGML_USE_CUDA)
+            // Multi-GPU: the model is split across devices, so each device only keeps
+            // ~model/n_devices of weights and must still fit the n_seq-scaled graph
+            // compute buffer. Bound n_seq by the tightest per-device budget. The
+            // context-creation retry safety net guarantees a fit even if this estimate
+            // is conservative.
+            {
+                const int cuda_device_count = ggml_backend_cuda_get_device_count();
+                if (cuda_device_count > 1 && selector_cuda_memory_known &&
+                        selector_cuda_min_free_gib > 0.0 && logits_gib_per_seq > 0.0) {
+                    double model_gib = 0.0;
+                    std::error_code ec;
+                    const uintmax_t model_bytes = std::filesystem::file_size(checkpoint_model_path, ec);
+                    if (!ec && model_bytes > 0) {
+                        model_gib = (double) model_bytes / (1024.0 * 1024.0 * 1024.0);
+                    }
+                    if (model_gib > 0.0) {
+                        const int mg_cap = selector_multi_gpu_n_seq_cap(
+                            cuda_device_count, selector_cuda_min_free_gib, model_gib,
+                            logits_gib_per_seq, SELECTOR_MULTIGPU_COMPUTE_FACTOR);
+                        if (mg_cap < std::numeric_limits<int>::max() && mg_cap < selector_n_seq) {
+                            fprintf(stderr,
+                                "%s: selector eval multi-GPU n_seq capped %d -> %d "
+                                "(devices=%d min_free=%.2f GiB model/device=%.2f GiB compute_factor=%.1f)\n",
+                                __func__, selector_n_seq, mg_cap, cuda_device_count,
+                                selector_cuda_min_free_gib, model_gib / (double) cuda_device_count,
+                                (double) SELECTOR_MULTIGPU_COMPUTE_FACTOR);
+                            selector_n_seq = mg_cap;
+                        }
+                    }
+                }
+            }
+#endif
             fprintf(stderr,
                 "%s: selector eval auto n_seq=%d from logits workspace %.2f GiB "
                 "(cuda_free=%.2f GiB cuda_reserve=%.2f GiB host_available=%.2f GiB host_reserve=%.2f GiB ctx=%d vocab=%d, %.2f GiB/seq, auto_cap=%d)\n",
@@ -8022,7 +8105,58 @@ static bool selector_choose_policy(
         if (load_heartbeat) {
             load_heartbeat->detail("loading runtime checkpoint", true);
         }
-        init_res = common_init_from_params(params);
+        // OOM recovery: try the chosen n_seq first, then halve down to 1. On
+        // multi-GPU or large models the auto value can still overestimate the
+        // graph compute buffer; rather than failing the whole selector, retry
+        // with a smaller n_seq until the context fits (or fall back to proxy).
+        std::vector<int> n_seq_candidates;
+        {
+            int c = selector_n_seq;
+            while (c >= 1) {
+                n_seq_candidates.push_back(c);
+                if (c == 1) {
+                    break;
+                }
+                c = std::max(1, c / 2);
+            }
+        }
+        const bool honor_eval_batch_first = selector_eval_batch_override > 0;
+        for (size_t ci = 0; ci < n_seq_candidates.size(); ++ci) {
+            const int try_n_seq = n_seq_candidates[ci];
+            params.n_ctx = kld.n_ctx * try_n_seq;
+            // Honor an explicit eval-batch cap on the first attempt only; on retry
+            // ignore it so the compute buffer shrinks together with n_seq.
+            params.n_batch = (honor_eval_batch_first && ci == 0)
+                ? std::min<int32_t>((int32_t) params.n_ctx, selector_eval_batch_override)
+                : params.n_ctx;
+            params.n_ubatch = params.n_batch;
+            params.n_parallel = try_n_seq;
+            init_res = common_init_from_params(params);
+            if (init_res) {
+                if (try_n_seq != selector_n_seq) {
+                    fprintf(stderr,
+                        "%s: selector stage-b context recovered with reduced n_seq=%d (auto=%d)\n",
+                        __func__, try_n_seq, selector_n_seq);
+                }
+                break;
+            }
+            fprintf(stderr,
+                "%s: selector stage-b context creation failed at n_seq=%d%s\n",
+                __func__, try_n_seq,
+                (ci + 1 < n_seq_candidates.size())
+                    ? "; retrying with smaller n_seq"
+                    : "; no smaller n_seq available, falling back to proxy evaluation");
+#if defined(GGML_USE_CUDA)
+            // Reclaim any partially allocated device memory before the next attempt.
+            if (ggml_backend_cuda_get_device_count() > 0) {
+                const int ndev = ggml_backend_cuda_get_device_count();
+                for (int d = 0; d < ndev; ++d) {
+                    selector_reset_cuda_device(d);
+                }
+            }
+#endif
+            init_res.reset();
+        }
         if (load_heartbeat) {
             load_heartbeat->finish(init_res ? "runtime checkpoint loaded" : "runtime checkpoint load failed");
         }
