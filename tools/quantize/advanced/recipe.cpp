@@ -290,6 +290,8 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "selector.only") { r.selector.only = parse_bool_value(value); return; }
     if (path == "selector.eval_top") { r.selector.eval_top = value; return; }
     if (path == "selector.n_seq") { r.selector.n_seq = value; return; }
+    if (path == "selector.eval_batch") { r.selector.eval_batch = value; return; }
+    if (path == "selector.n_gpu_layers") { r.selector.n_gpu_layers = value; return; }
     if (path == "selector.sensitivity_report") { r.selector.sensitivity_report = value; return; }
     if (path == "selector.sensitivity_top") { r.selector.sensitivity_top = value; return; }
     if (path == "selector.sensitivity_layer") { r.selector.sensitivity_layer = value; return; }
@@ -1004,6 +1006,8 @@ std::string dump_recipe_toml(const Recipe & r) {
         dump_bool(out, "only", r.selector.only);
         dump_string(out, "eval_top", r.selector.eval_top);
         dump_string(out, "n_seq", r.selector.n_seq);
+        dump_string(out, "eval_batch", r.selector.eval_batch);
+        dump_string(out, "n_gpu_layers", r.selector.n_gpu_layers);
     }
     dump_string(out, "sensitivity_report", r.selector.sensitivity_report);
     dump_string(out, "sensitivity_top", r.selector.sensitivity_top);
@@ -1481,8 +1485,13 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
     push_bool("--selector-only", r.selector.only);
     if (!use_mode_defaults) {
         push_pair("--selector-eval-top", r.selector.eval_top);
-        push_pair("--selector-n-seq", r.selector.n_seq);
     }
+    // These are forwarded unconditionally: when empty the quantize binary falls
+    // back to its own auto n_seq / eval-batch / n_gpu_layers, and when set they
+    // let the user override the multi-GPU-aware auto tuning.
+    push_pair("--selector-n-seq", r.selector.n_seq);
+    push_pair("--selector-eval-batch", r.selector.eval_batch);
+    push_pair("--selector-n-gpu-layers", r.selector.n_gpu_layers);
     push_pair("--selector-sensitivity-report", r.selector.sensitivity_report);
     push_pair("--selector-sensitivity-top", r.selector.sensitivity_top);
     push_pair("--selector-sensitivity-layer", r.selector.sensitivity_layer);

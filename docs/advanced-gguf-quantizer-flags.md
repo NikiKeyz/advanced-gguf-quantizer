@@ -89,6 +89,21 @@ Runtime and memory:
 - use checkpoints and resume for long runs;
 - reduce measured-candidate breadth when memory is tight.
 
+Selector runtime context sizing (advanced-gguf-quantizer only):
+
+- `selector.n_seq`: optional parallel KLD evaluation sequence count. Leave blank
+  for the auto value. The auto value is tuned for throughput, but on multi-GPU
+  it is additionally capped by the tightest per-device VRAM budget (model split
+  plus the n_seq-scaled graph compute buffer). If context creation still fails,
+  the loader retries with a halved `n_seq` down to 1 before falling back to
+  proxy-only selection. Set this only to force a specific value.
+- `selector.eval_batch`: optional override for the selector calibration
+  micro-batch (`n_batch`/`n_ubatch`). Leave blank to use the auto value
+  (`n_ctx`). A smaller value bounds the activation buffer on small GPUs.
+- `selector.n_gpu_layers`: optional layer offload count for the selector
+  calibration context. Leave blank for the tool default (all layers on GPU).
+  Reduce it only when you intentionally want CPU offload.
+
 Stream counts, row chunk sizes, selector workers, and logits workspace internals
 are resolved implementation details. They may appear in locked run manifests for
 reproducibility, but they are not public tuning knobs.

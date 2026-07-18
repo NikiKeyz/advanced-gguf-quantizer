@@ -183,6 +183,8 @@ struct Recipe {
         bool only = false;
         std::string eval_top;
         std::string n_seq;
+        std::string eval_batch;
+        std::string n_gpu_layers;
         std::string sensitivity_report;
         std::string sensitivity_top;
         std::string sensitivity_layer;
