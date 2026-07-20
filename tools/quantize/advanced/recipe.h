@@ -185,6 +185,8 @@ struct Recipe {
         std::string n_seq;
         std::string eval_batch;
         std::string n_gpu_layers;
+        std::string tensor_split;
+        std::string verbosity;
         std::string sensitivity_report;
         std::string sensitivity_top;
         std::string sensitivity_layer;

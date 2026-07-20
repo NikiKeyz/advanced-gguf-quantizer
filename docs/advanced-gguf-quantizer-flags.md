@@ -103,6 +103,19 @@ Selector runtime context sizing (advanced-gguf-quantizer only):
 - `selector.n_gpu_layers`: optional layer offload count for the selector
   calibration context. Leave blank for the tool default (all layers on GPU).
   Reduce it only when you intentionally want CPU offload.
+- `selector.tensor_split`: multi-GPU weight distribution for the selector
+  calibration context. Format: `"0.5/0.5"` (one weight per visible GPU).
+  Accepted separators: `/`, `,`, `;`, `:`. When set, llama.cpp divides the
+  model layers (split-mode=layer) and the per-device compute buffers
+  proportionally to these weights, instead of the default free-memory split
+  which can produce uneven VRAM distribution (one GPU holding the lm_head
+  logits buffer becoming much heavier). Leave blank for the default
+  free-memory split.
+- `selector.verbosity`: optional debug verbosity for the selector calibration
+  context load. Set to `3` (INFO) or higher to surface llama.cpp's per-device
+  compute buffer and KV buffer size lines, which show exactly how VRAM is
+  distributed across GPUs. Leave blank for the default (only warnings/errors
+  shown).
 
 Stream counts, row chunk sizes, selector workers, and logits workspace internals
 are resolved implementation details. They may appear in locked run manifests for

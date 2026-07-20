@@ -1,4 +1,5 @@
 #include "common.h"
+#include "log.h"
 #include "build-info.h"
 #include "ggml-cuda.h"
 #include "llama.h"
@@ -103,11 +104,14 @@ static constexpr int     SELECTOR_N_SEQ_AUTO_MAX = 32;
 static constexpr double  SELECTOR_N_SEQ_CUDA_RESERVE_MIN_GIB = 4.0;
 static constexpr double  SELECTOR_N_SEQ_CUDA_RESERVE_MAX_GIB = 16.0;
 static constexpr double  SELECTOR_N_SEQ_CUDA_RESERVE_FRACTION = 0.20;
-// Headroom multiplier applied to the per-seq logits buffer when budgeting the
-// n_seq-scaled graph compute buffer on multi-GPU. The exact compute buffer size
-// is hard to model portably, so this stays conservative; the context-creation
-// retry safety net guarantees a fit regardless of the estimate.
-static constexpr double  SELECTOR_MULTIGPU_COMPUTE_FACTOR = 2.5;
+// Overhead multiplier applied on top of the exact per-n_seq logits buffer when
+// budgeting the n_seq-scaled VRAM on multi-GPU. The lm_head logits buffer is the
+// dominant n_seq-scaled term and lives entirely on the output device; it is
+// modelled exactly (vocab * n_ctx * 4 bytes, see selector_multi_gpu_n_seq_cap).
+// This factor adds a small margin for the secondary n_seq-scaled terms (KV
+// cache, recurrent state, graph compute buffer) that are smaller than the
+// logits buffer. The context-creation retry safety net still guarantees a fit.
+static constexpr double  SELECTOR_MULTIGPU_COMPUTE_FACTOR = 1.2;
 static constexpr double  SELECTOR_MXFP6_PPL_ABS_TOL = 2e-4;
 static constexpr double  SELECTOR_MXFP6_PPL_REL_TOL = 0.01;
 static constexpr double  SELECTOR_MXFP6_MEAN_KLD_ABS_TOL = 7.5e-5;
@@ -379,31 +383,68 @@ static bool selector_reset_cuda_device(int device) {
 #endif
 }
 
-// Maximum n_seq that fits the tightest per-device VRAM budget on a multi-GPU
-// setup. With n_gpu_layers covering all layers, llama.cpp splits the model
-// across devices, so each device keeps ~model_gib/n_devices of weights and must
-// still fit the graph compute buffer, which scales linearly with n_seq. Returns
-// INT_MAX when there is no multi-GPU constraint (single device or missing info),
-// so callers can simply take the min with their current n_seq.
+// Maximum n_seq that fits the per-device VRAM budget on a multi-GPU setup.
+// llama.cpp splits the model across devices (layer mode), so each device keeps
+// ~model_gib * w_d of weights, where w_d is its normalized tensor_split share
+// (or 1/n_devices when unset). The binding constraint is the OUTPUT device: the
+// device holding the lm_head also holds the lm_head logits buffer, which is the
+// dominant n_seq-scaled term and lives entirely there. It is exactly
+//   logits_gib(n_seq) = n_vocab * (kld.n_ctx * n_seq) * sizeof(float)
+// i.e. it grows linearly with n_seq at logits_gib_per_seq bytes per n_seq. The
+// secondary n_seq-scaled terms (KV cache, recurrent state, graph compute
+// buffer) are smaller and approximated by the overhead factor. We size n_seq so
+// the output device fits. Returns INT_MAX when there is no multi-GPU constraint
+// (single device or missing info), so callers can take the min with their n_seq.
 static int selector_multi_gpu_n_seq_cap(
         int n_devices,
         double min_free_gib,
         double model_gib,
         double logits_gib_per_seq,
-        double compute_factor) {
+        double overhead_factor,
+        const float * tensor_split) {
     if (n_devices <= 1 || min_free_gib <= 0.0 || logits_gib_per_seq <= 0.0) {
         return std::numeric_limits<int>::max();
     }
-    const double model_per_device_gib = model_gib / (double) n_devices;
-    const double available_gib = min_free_gib - model_per_device_gib;
-    if (available_gib <= 0.0) {
+    // Normalized per-device weight shares; default to an even split.
+    std::vector<double> w(n_devices, 0.0);
+    double sum = 0.0;
+    bool any = false;
+    for (int i = 0; i < n_devices; ++i) {
+        const double v = tensor_split != nullptr ? (double) tensor_split[i] : 0.0;
+        if (v > 0.0) {
+            w[i] = v;
+            sum += v;
+            any = true;
+        }
+    }
+    if (!any) {
+        for (int i = 0; i < n_devices; ++i) {
+            w[i] = 1.0;
+            sum += 1.0;
+        }
+    }
+    for (int i = 0; i < n_devices; ++i) {
+        w[i] /= sum;
+    }
+    // The output device is the one with the largest weight share: it owns the
+    // lm_head and therefore the full logits buffer. It is the binding constraint.
+    int out_dev = 0;
+    for (int i = 1; i < n_devices; ++i) {
+        if (w[i] > w[out_dev]) {
+            out_dev = i;
+        }
+    }
+    const double weight_on_out = model_gib * w[out_dev];
+    const double free_on_out   = min_free_gib;  // measured before load; equal across devices at that point
+    const double budget_gib    = free_on_out - weight_on_out;
+    if (budget_gib <= 0.0) {
         return 1;
     }
-    const double scalable_per_seq_gib = logits_gib_per_seq * compute_factor;
-    if (scalable_per_seq_gib <= 0.0) {
+    const double per_n_seq_gib = logits_gib_per_seq * overhead_factor;
+    if (per_n_seq_gib <= 0.0) {
         return 1;
     }
-    return std::max(1, (int) std::floor(available_gib / scalable_per_seq_gib));
+    return std::max(1, (int) std::floor(budget_gib / per_n_seq_gib));
 }
 
 struct selector_rank_config {
@@ -7775,14 +7816,15 @@ static bool selector_choose_policy(
                     if (model_gib > 0.0) {
                         const int mg_cap = selector_multi_gpu_n_seq_cap(
                             cuda_device_count, selector_cuda_min_free_gib, model_gib,
-                            logits_gib_per_seq, SELECTOR_MULTIGPU_COMPUTE_FACTOR);
+                            logits_gib_per_seq, SELECTOR_MULTIGPU_COMPUTE_FACTOR,
+                            nullptr);
                         if (mg_cap < std::numeric_limits<int>::max() && mg_cap < selector_n_seq) {
                             fprintf(stderr,
                                 "%s: selector eval multi-GPU n_seq capped %d -> %d "
-                                "(devices=%d min_free=%.2f GiB model/device=%.2f GiB compute_factor=%.1f)\n",
+                                "(devices=%d min_free=%.2f GiB model=%.2f GiB logits=%.3f GiB/seq overhead=%.2f)\n",
                                 __func__, selector_n_seq, mg_cap, cuda_device_count,
-                                selector_cuda_min_free_gib, model_gib / (double) cuda_device_count,
-                                (double) SELECTOR_MULTIGPU_COMPUTE_FACTOR);
+                                selector_cuda_min_free_gib, model_gib,
+                                logits_gib_per_seq, (double) SELECTOR_MULTIGPU_COMPUTE_FACTOR);
                             selector_n_seq = mg_cap;
                         }
                     }
@@ -7814,6 +7856,33 @@ static bool selector_choose_policy(
     params.n_ubatch = params.n_batch;
     params.n_parallel = selector_n_seq;
     params.n_gpu_layers = (int32_t) selector_control_i64("N_GPU_LAYERS", 9999);
+    // Optional explicit multi-GPU tensor split (recipe selector.tensor_split or
+    // --nvfp4-selector-tensor-split). When set, llama.cpp divides the model and
+    // the graph compute buffers by these weights instead of the default
+    // free-memory split, which is what produced the uneven per-GPU VRAM load.
+    {
+        const std::string ts = selector_control_string("TENSOR_SPLIT", "");
+        if (!ts.empty()) {
+            std::string norm = ts;
+            for (char & c : norm) {
+                if (c == '/' || c == ';' || c == ':') {
+                    c = ' ';
+                }
+            }
+            std::istringstream iss(norm);
+            float v = 0.0f;
+            int i = 0;
+            while (iss >> v && i < 128) {
+                params.tensor_split[i++] = v;
+            }
+            for (int j = i; j < 128; ++j) {
+                params.tensor_split[j] = 0.0f;
+            }
+            fprintf(stderr,
+                "%s: selector stage-b explicit tensor_split set (%d weights): %s\n",
+                __func__, i, ts.c_str());
+        }
+    }
     params.cpuparams.n_threads = std::max(1, nthread);
     params.cpuparams_batch.n_threads = std::max(1, nthread);
     // Selector full PPL/KLD evaluation patches tensor buffers in a calibration-only context with
@@ -7883,6 +7952,8 @@ static bool selector_choose_policy(
             {"n_batch", params.n_batch},
             {"n_ubatch", params.n_ubatch},
             {"n_gpu_layers", params.n_gpu_layers},
+            {"tensor_split", selector_control_string("TENSOR_SPLIT", "")},
+            {"verbosity", selector_control_string("VERBOSITY", "")},
             {"input_scale_policy", nvfp4_input_scale_policy},
         };
         key["encoder"] = {
@@ -8083,21 +8154,64 @@ static bool selector_choose_policy(
     common_init_result_ptr init_res;
     llama_context * lctx = nullptr;
     if (run_stageb_eval && !stageb_cache_only_eval) {
+        // Opt-in: raise the global log verbosity during the stage-b model/context
+        // load so llama.cpp's per-device INFO lines (compute buffer size, KV buffer
+        // size, tensor split) become visible. Restored right after the context is
+        // created. Controlled by selector.verbosity / --nvfp4-selector-verbosity
+        // (e.g. 3 = INFO). Default (unset) leaves the existing log level alone.
+        int saved_verbosity_thold = -1;
+        bool verbosity_overridden = false;
+        {
+            const int v = (int) selector_control_i64("VERBOSITY", -1);
+            if (v >= 0) {
+                saved_verbosity_thold = common_log_get_verbosity_thold();
+                common_log_set_verbosity_thold(v);
+                verbosity_overridden = true;
+                fprintf(stderr,
+                    "%s: selector stage-b verbosity raised to %d for model/context load\n",
+                    __func__, v);
+            }
+        }
 #if defined(GGML_USE_CUDA)
         if (ggml_backend_cuda_get_device_count() > 0) {
-            size_t cuda_free = 0;
-            size_t cuda_total = 0;
-            ggml_backend_cuda_get_device_memory(0, &cuda_free, &cuda_total);
+            const int ndev = ggml_backend_cuda_get_device_count();
+            const std::string ts_raw = selector_control_string("TENSOR_SPLIT", "");
+            if (!ts_raw.empty()) {
+                int provided = 0;
+                for (int i = 0; i < 128 && params.tensor_split[i] != 0.0f; ++i) {
+                    ++provided;
+                }
+                if (provided != ndev) {
+                    fprintf(stderr,
+                        "%s: WARNING selector tensor_split has %d weight(s) but %d CUDA device(s) are visible; "
+                        "fill one weight per device or the missing device(s) will get no tensors\n",
+                        __func__, provided, ndev);
+                }
+            }
             fprintf(stderr,
-                "%s: selector stage-b CUDA memory before checkpoint load free=%.2f GiB total=%.2f GiB n_gpu_layers=%d n_seq=%d n_ctx=%d n_batch=%d n_ubatch=%d\n",
+                "%s: selector stage-b multi-GPU plan: devices=%d split_mode=%d n_gpu_layers=%d n_seq=%d n_ctx=%d n_batch=%d n_ubatch=%d tensor_split=\"%s\"\n",
                 __func__,
-                (double) cuda_free / (1024.0 * 1024.0 * 1024.0),
-                (double) cuda_total / (1024.0 * 1024.0 * 1024.0),
+                ndev,
+                (int) params.split_mode,
                 params.n_gpu_layers,
                 selector_n_seq,
                 (int) params.n_ctx,
                 (int) params.n_batch,
-                (int) params.n_ubatch);
+                (int) params.n_ubatch,
+                ts_raw.c_str());
+            for (int d = 0; d < ndev; ++d) {
+                size_t cuda_free = 0;
+                size_t cuda_total = 0;
+                ggml_backend_cuda_get_device_memory(d, &cuda_free, &cuda_total);
+                fprintf(stderr,
+                    "%s:   CUDA%-2d before load: free=%.2f GiB total=%.2f GiB used=%.2f GiB (%.1f%%)\n",
+                    __func__,
+                    d,
+                    (double) cuda_free / (1024.0 * 1024.0 * 1024.0),
+                    (double) cuda_total / (1024.0 * 1024.0 * 1024.0),
+                    (double) (cuda_total - cuda_free) / (1024.0 * 1024.0 * 1024.0),
+                    100.0 * (double) (cuda_total - cuda_free) / (double) std::max<size_t>(1, cuda_total));
+            }
         }
 #endif
         // The selector mutates already-loaded tensor buffers between KLD probes,
@@ -8161,7 +8275,31 @@ static bool selector_choose_policy(
             load_heartbeat->finish(init_res ? "runtime checkpoint loaded" : "runtime checkpoint load failed");
         }
         lctx = init_res ? init_res->context() : nullptr;
+        if (verbosity_overridden) {
+            common_log_set_verbosity_thold(saved_verbosity_thold);
+        }
     }
+#if defined(GGML_USE_CUDA)
+    if (lctx != nullptr && ggml_backend_cuda_get_device_count() > 0) {
+        const int ndev = ggml_backend_cuda_get_device_count();
+        fprintf(stderr,
+            "%s: selector stage-b CUDA memory after checkpoint load (n_seq=%d):\n",
+            __func__, selector_n_seq);
+        for (int d = 0; d < ndev; ++d) {
+            size_t cuda_free = 0;
+            size_t cuda_total = 0;
+            ggml_backend_cuda_get_device_memory(d, &cuda_free, &cuda_total);
+            fprintf(stderr,
+                "%s:   CUDA%-2d after  load: free=%.2f GiB total=%.2f GiB used=%.2f GiB (%.1f%%)\n",
+                __func__,
+                d,
+                (double) cuda_free / (1024.0 * 1024.0 * 1024.0),
+                (double) cuda_total / (1024.0 * 1024.0 * 1024.0),
+                (double) (cuda_total - cuda_free) / (1024.0 * 1024.0 * 1024.0),
+                100.0 * (double) (cuda_total - cuda_free) / (double) std::max<size_t>(1, cuda_total));
+        }
+    }
+#endif
     bool have_runtime_eval = run_stageb_eval && lctx != nullptr;
     bool have_measured_eval = stageb_cache_only_eval || have_runtime_eval;
     if (run_stageb_eval && !have_measured_eval) {
@@ -11756,6 +11894,18 @@ int llama_quantize(int argc, char ** argv) {
         } else if (strcmp(arg_name, "--nvfp4-selector-n-gpu-layers") == 0) {
             if (arg_idx < argc-1) {
                 add_selector_control("N_GPU_LAYERS", argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(arg_name, "--nvfp4-selector-tensor-split") == 0) {
+            if (arg_idx < argc-1) {
+                add_selector_control("TENSOR_SPLIT", argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(arg_name, "--nvfp4-selector-verbosity") == 0) {
+            if (arg_idx < argc-1) {
+                add_selector_control("VERBOSITY", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
