@@ -119,6 +119,15 @@ Selector runtime context sizing (advanced-gguf-quantizer only):
   `n_seq` and, when even `n_seq=1` is insufficient, warns that the split is
   unbalanced and falls back to proxy-only selection. Favour a split that leaves
   roughly equal free VRAM on every device.
+- `selector.tensor_split_auto`: when `true`, the selector measures the per-device
+  VRAM footprint of a probe load and picks a `tensor_split` that leaves roughly
+  equal free VRAM on every device (the lm_head logits buffer lives on the CUDA
+  host and the recurrent-state / compute buffers are not split evenly by
+  llama.cpp's free-memory split, so a naive split can starve one device). This
+  overrides an explicit `selector.tensor_split` and re-balances per checkpoint,
+  so it survives checkpoint size changes. Off by default; enable it for large
+  models (e.g. 27B) instead of hand-tuning `tensor_split`. It adds one probe
+  model load per checkpoint.
 - `selector.verbosity`: optional debug verbosity for the selector calibration
   context load. Set to `3` (INFO) or higher to surface llama.cpp's per-device
   compute buffer and KV buffer size lines, which show exactly how VRAM is

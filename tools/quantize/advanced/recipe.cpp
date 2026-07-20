@@ -293,6 +293,7 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "selector.eval_batch") { r.selector.eval_batch = value; return; }
     if (path == "selector.n_gpu_layers") { r.selector.n_gpu_layers = value; return; }
     if (path == "selector.tensor_split") { r.selector.tensor_split = value; return; }
+    if (path == "selector.tensor_split_auto") { r.selector.tensor_split_auto = parse_bool_value(value); return; }
     if (path == "selector.verbosity") { r.selector.verbosity = value; return; }
     if (path == "selector.sensitivity_report") { r.selector.sensitivity_report = value; return; }
     if (path == "selector.sensitivity_top") { r.selector.sensitivity_top = value; return; }
@@ -1011,6 +1012,7 @@ std::string dump_recipe_toml(const Recipe & r) {
         dump_string(out, "eval_batch", r.selector.eval_batch);
         dump_string(out, "n_gpu_layers", r.selector.n_gpu_layers);
         dump_string(out, "tensor_split", r.selector.tensor_split);
+        dump_bool(out, "tensor_split_auto", r.selector.tensor_split_auto);
         dump_string(out, "verbosity", r.selector.verbosity);
     }
     dump_string(out, "sensitivity_report", r.selector.sensitivity_report);
@@ -1497,6 +1499,9 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
     push_pair("--selector-eval-batch", r.selector.eval_batch);
     push_pair("--selector-n-gpu-layers", r.selector.n_gpu_layers);
     push_pair("--selector-tensor-split", r.selector.tensor_split);
+    if (r.selector.tensor_split_auto) {
+        push_pair("--nvfp4-selector-tensor-split-auto", "1");
+    }
     push_pair("--selector-verbosity", r.selector.verbosity);
     push_pair("--selector-sensitivity-report", r.selector.sensitivity_report);
     push_pair("--selector-sensitivity-top", r.selector.sensitivity_top);

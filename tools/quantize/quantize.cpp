@@ -108,8 +108,11 @@ static constexpr double  SELECTOR_N_SEQ_CUDA_RESERVE_FRACTION = 0.20;
 // is created, so that tensor-eval scratch buffers (allocated during KLD probes,
 // not during context creation) do not OOM. The context-creation retry loop only
 // catches allocation failures at create time; eval-time cudaMalloc happens later
-// and needs this headroom. This is what the 27B/43-23 run was missing.
-static constexpr double  SELECTOR_STAGEB_EVAL_RESERVE_GIB = 2.0;
+// and needs this headroom. For the 27B Gated-Delta-Net hybrid the eval scratch
+// for a single tensor (e.g. the output layer) is ~2.2+ GiB, so this must sit
+// above that; a skewed tensor_split that leaves a device below this after load
+// is shrunk to n_seq=1 and, if still short, falls back to proxy evaluation.
+static constexpr double  SELECTOR_STAGEB_EVAL_RESERVE_GIB = 2.5;
 // Estimated n_seq-scaled GPU cost (graph compute buffer + recurrent-state
 // buffer) as a fraction of the on-disk model size, in GiB per GiB-file per
 // n_seq. Empirically ~0.04 for the qwen35 Gated-Delta-Net hybrid (4B and 27B).
@@ -461,6 +464,72 @@ static int selector_multi_gpu_n_seq_cap(
         return 1;
     }
     return std::max(1, (int) std::floor(min_budget / per_n_seq));
+}
+
+// Measure the per-device VRAM footprint of a probe context load and return a
+// tensor_split that balances free VRAM across devices. The lm_head logits buffer
+// lives on the CUDA host and the recurrent-state / compute buffers are not split
+// evenly by llama.cpp's free-memory split, so a naive split can leave one device
+// starved (the 27B / 42-24 eval-time OOM). We load once at n_seq=1 with an even
+// split, measure each device's footprint, then weight the split proportionally to
+// that footprint so every device ends up with roughly equal free VRAM. The n_seq
+// cap then keeps higher n_seq safe. Returns an empty vector when not applicable
+// (single device, no CUDA, or the probe load failed).
+static std::vector<float> selector_auto_tensor_split(
+        const std::string & model_path,
+        int n_devices) {
+    std::vector<float> out;
+#if defined(GGML_USE_CUDA)
+    if (n_devices <= 1 || model_path.empty()) {
+        return out;
+    }
+    common_params probe;
+    probe.model.path = model_path;
+    probe.n_ctx = 512;
+    probe.n_batch = 512;
+    probe.n_ubatch = 512;
+    probe.n_parallel = 1;
+    probe.n_gpu_layers = 9999;
+    for (int i = 0; i < n_devices; ++i) {
+        probe.tensor_split[i] = 1.0f;
+    }
+    auto dev_free_gib = [](int d) -> double {
+        size_t f = 0, t = 0;
+        ggml_backend_cuda_get_device_memory(d, &f, &t);
+        return (double) f / (1024.0 * 1024.0 * 1024.0);
+    };
+    std::vector<double> before(n_devices);
+    for (int d = 0; d < n_devices; ++d) {
+        before[d] = dev_free_gib(d);
+    }
+    common_init_result_ptr res = common_init_from_params(probe);
+    if (!res) {
+        return out;
+    }
+    std::vector<double> footprint(n_devices);
+    double total = 0.0;
+    bool ok = true;
+    for (int d = 0; d < n_devices; ++d) {
+        const double after = dev_free_gib(d);
+        footprint[d] = before[d] - after;
+        if (footprint[d] <= 0.0) {
+            ok = false;
+        }
+        total += footprint[d];
+    }
+    res.reset();
+    for (int d = 0; d < n_devices; ++d) {
+        selector_reset_cuda_device(d);
+    }
+    if (!ok || total <= 0.0) {
+        return out;
+    }
+    out.resize(n_devices);
+    for (int d = 0; d < n_devices; ++d) {
+        out[d] = (float) (footprint[d] / total);
+    }
+#endif
+    return out;
 }
 
 struct selector_rank_config {
@@ -7881,7 +7950,8 @@ static bool selector_choose_policy(
     // free-memory split, which is what produced the uneven per-GPU VRAM load.
     {
         const std::string ts = selector_control_string("TENSOR_SPLIT", "");
-        if (!ts.empty()) {
+        const bool auto_split = selector_control_i64("TENSOR_SPLIT_AUTO", 0) != 0;
+        if (!ts.empty() && !auto_split) {
             std::string norm = ts;
             for (char & c : norm) {
                 if (c == '/' || c == ';' || c == ':') {
@@ -7900,6 +7970,39 @@ static bool selector_choose_policy(
             fprintf(stderr,
                 "%s: selector stage-b explicit tensor_split set (%d weights): %s\n",
                 __func__, i, ts.c_str());
+        } else if (auto_split) {
+            // Auto-balance the split so every device keeps roughly equal free
+            // VRAM (no device left holding the lm_head/RS/compute penalty alone).
+            // This overrides an explicit tensor_split when auto is requested and
+            // also applies when none is set, surviving checkpoint size changes.
+#if defined(GGML_USE_CUDA)
+            const int ndev = ggml_backend_cuda_get_device_count();
+            if (ndev > 1) {
+                std::vector<float> bal = selector_auto_tensor_split(checkpoint_model_path, ndev);
+                if (!bal.empty()) {
+                    for (int j = 0; j < 128; ++j) {
+                        params.tensor_split[j] = (j < (int) bal.size()) ? bal[j] : 0.0f;
+                    }
+                    fprintf(stderr, "%s: selector stage-b auto tensor_split =", __func__);
+                    for (size_t j = 0; j < bal.size(); ++j) {
+                        fprintf(stderr, " %.3f", bal[j]);
+                    }
+                    fprintf(stderr, "\n");
+                } else {
+                    for (int j = 0; j < ndev; ++j) {
+                        params.tensor_split[j] = 1.0f;
+                    }
+                    for (int j = ndev; j < 128; ++j) {
+                        params.tensor_split[j] = 0.0f;
+                    }
+                    fprintf(stderr,
+                        "%s: selector stage-b auto tensor_split unavailable; using even split\n",
+                        __func__);
+                }
+            }
+#else
+            (void) auto_split;
+#endif
         }
     }
     params.cpuparams.n_threads = std::max(1, nthread);
@@ -11986,6 +12089,12 @@ int llama_quantize(int argc, char ** argv) {
         } else if (strcmp(arg_name, "--nvfp4-selector-tensor-split") == 0) {
             if (arg_idx < argc-1) {
                 add_selector_control("TENSOR_SPLIT", argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(arg_name, "--nvfp4-selector-tensor-split-auto") == 0) {
+            if (arg_idx < argc-1) {
+                add_selector_control("TENSOR_SPLIT_AUTO", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
