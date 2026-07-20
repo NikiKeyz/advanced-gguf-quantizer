@@ -104,13 +104,19 @@ static constexpr int     SELECTOR_N_SEQ_AUTO_MAX = 32;
 static constexpr double  SELECTOR_N_SEQ_CUDA_RESERVE_MIN_GIB = 4.0;
 static constexpr double  SELECTOR_N_SEQ_CUDA_RESERVE_MAX_GIB = 16.0;
 static constexpr double  SELECTOR_N_SEQ_CUDA_RESERVE_FRACTION = 0.20;
-// Overhead multiplier applied on top of the exact per-n_seq logits buffer when
-// budgeting the n_seq-scaled VRAM on multi-GPU. The lm_head logits buffer is the
-// dominant n_seq-scaled term and lives entirely on the output device; it is
-// modelled exactly (vocab * n_ctx * 4 bytes, see selector_multi_gpu_n_seq_cap).
-// This factor adds a small margin for the secondary n_seq-scaled terms (KV
-// cache, recurrent state, graph compute buffer) that are smaller than the
-// logits buffer. The context-creation retry safety net still guarantees a fit.
+// Per-n_seq VRAM that must stay free on EVERY device after the stage-b context
+// is created, so that tensor-eval scratch buffers (allocated during KLD probes,
+// not during context creation) do not OOM. The context-creation retry loop only
+// catches allocation failures at create time; eval-time cudaMalloc happens later
+// and needs this headroom. This is what the 27B/43-23 run was missing.
+static constexpr double  SELECTOR_STAGEB_EVAL_RESERVE_GIB = 2.0;
+// Estimated n_seq-scaled GPU cost (graph compute buffer + recurrent-state
+// buffer) as a fraction of the on-disk model size, in GiB per GiB-file per
+// n_seq. Empirically ~0.04 for the qwen35 Gated-Delta-Net hybrid (4B and 27B).
+// The lm_head logits buffer lives on the CUDA host and is negligible on the
+// devices. This is only a first guess; the post-load free-VRAM check corrects it.
+static constexpr double  SELECTOR_MULTIGPU_PER_NSEQ_MODEL_K = 0.04;
+// Margin applied on top of the per-n_seq estimate when budgeting n_seq.
 static constexpr double  SELECTOR_MULTIGPU_COMPUTE_FACTOR = 1.2;
 static constexpr double  SELECTOR_MXFP6_PPL_ABS_TOL = 2e-4;
 static constexpr double  SELECTOR_MXFP6_PPL_REL_TOL = 0.01;
@@ -392,17 +398,26 @@ static bool selector_reset_cuda_device(int device) {
 //   logits_gib(n_seq) = n_vocab * (kld.n_ctx * n_seq) * sizeof(float)
 // i.e. it grows linearly with n_seq at logits_gib_per_seq bytes per n_seq. The
 // secondary n_seq-scaled terms (KV cache, recurrent state, graph compute
-// buffer) are smaller and approximated by the overhead factor. We size n_seq so
-// the output device fits. Returns INT_MAX when there is no multi-GPU constraint
-// (single device or missing info), so callers can take the min with their n_seq.
+// Multi-GPU cap on the parallel KLD eval sequence count (n_seq).
+//
+// The n_seq-scaled GPU cost on each device is the graph compute buffer plus the
+// recurrent-state (RS) buffer; the lm_head logits buffer lives on the CUDA host
+// and is negligible on the devices (see the per-device INFO lines at load).
+//
+// We budget n_seq so that EVERY device keeps at least eval_reserve_gib free
+// after the context is created, leaving room for eval-time scratch buffers.
+// The estimate uses the on-disk model size (compute+RS scale with it) and a
+// small margin; the post-load free-VRAM check in the stage-b loader is the real
+// guarantee. Returns INT_MAX when there is no multi-GPU constraint.
 static int selector_multi_gpu_n_seq_cap(
         int n_devices,
         double min_free_gib,
         double model_gib,
-        double logits_gib_per_seq,
+        double per_n_seq_gib,
         double overhead_factor,
+        double eval_reserve_gib,
         const float * tensor_split) {
-    if (n_devices <= 1 || min_free_gib <= 0.0 || logits_gib_per_seq <= 0.0) {
+    if (n_devices <= 1 || min_free_gib <= 0.0 || per_n_seq_gib <= 0.0) {
         return std::numeric_limits<int>::max();
     }
     // Normalized per-device weight shares; default to an even split.
@@ -426,25 +441,26 @@ static int selector_multi_gpu_n_seq_cap(
     for (int i = 0; i < n_devices; ++i) {
         w[i] /= sum;
     }
-    // The output device is the one with the largest weight share: it owns the
-    // lm_head and therefore the full logits buffer. It is the binding constraint.
-    int out_dev = 0;
-    for (int i = 1; i < n_devices; ++i) {
-        if (w[i] > w[out_dev]) {
-            out_dev = i;
+    // Every device must keep eval_reserve free after load. The tightest device
+    // (largest weight share) is the binding constraint under an even compute
+    // split; pipeline parallelism can shift compute, but being conservative here
+    // only costs throughput, never correctness.
+    double min_budget = std::numeric_limits<double>::max();
+    for (int i = 0; i < n_devices; ++i) {
+        const double weight_on_dev = model_gib * w[i];
+        const double budget = min_free_gib - weight_on_dev - eval_reserve_gib;
+        if (budget < min_budget) {
+            min_budget = budget;
         }
     }
-    const double weight_on_out = model_gib * w[out_dev];
-    const double free_on_out   = min_free_gib;  // measured before load; equal across devices at that point
-    const double budget_gib    = free_on_out - weight_on_out;
-    if (budget_gib <= 0.0) {
+    if (min_budget <= 0.0) {
         return 1;
     }
-    const double per_n_seq_gib = logits_gib_per_seq * overhead_factor;
-    if (per_n_seq_gib <= 0.0) {
+    const double per_n_seq = per_n_seq_gib * overhead_factor;
+    if (per_n_seq <= 0.0) {
         return 1;
     }
-    return std::max(1, (int) std::floor(budget_gib / per_n_seq_gib));
+    return std::max(1, (int) std::floor(min_budget / per_n_seq));
 }
 
 struct selector_rank_config {
@@ -7814,19 +7830,22 @@ static bool selector_choose_policy(
                         model_gib = (double) model_bytes / (1024.0 * 1024.0 * 1024.0);
                     }
                     if (model_gib > 0.0) {
-                        const int mg_cap = selector_multi_gpu_n_seq_cap(
+                    const int mg_cap = selector_multi_gpu_n_seq_cap(
                             cuda_device_count, selector_cuda_min_free_gib, model_gib,
-                            logits_gib_per_seq, SELECTOR_MULTIGPU_COMPUTE_FACTOR,
+                            SELECTOR_MULTIGPU_PER_NSEQ_MODEL_K * model_gib,
+                            SELECTOR_MULTIGPU_COMPUTE_FACTOR,
+                            SELECTOR_STAGEB_EVAL_RESERVE_GIB,
                             nullptr);
-                        if (mg_cap < std::numeric_limits<int>::max() && mg_cap < selector_n_seq) {
-                            fprintf(stderr,
-                                "%s: selector eval multi-GPU n_seq capped %d -> %d "
-                                "(devices=%d min_free=%.2f GiB model=%.2f GiB logits=%.3f GiB/seq overhead=%.2f)\n",
-                                __func__, selector_n_seq, mg_cap, cuda_device_count,
-                                selector_cuda_min_free_gib, model_gib,
-                                logits_gib_per_seq, (double) SELECTOR_MULTIGPU_COMPUTE_FACTOR);
-                            selector_n_seq = mg_cap;
-                        }
+                    if (mg_cap < std::numeric_limits<int>::max() && mg_cap < selector_n_seq) {
+                        fprintf(stderr,
+                            "%s: selector eval multi-GPU n_seq capped %d -> %d "
+                            "(devices=%d min_free=%.2f GiB model=%.2f GiB per_n_seq~%.3f GiB/seq reserve=%.2f GiB)\n",
+                            __func__, selector_n_seq, mg_cap, cuda_device_count,
+                            selector_cuda_min_free_gib, model_gib,
+                            (double) (SELECTOR_MULTIGPU_PER_NSEQ_MODEL_K * model_gib),
+                            (double) SELECTOR_STAGEB_EVAL_RESERVE_GIB);
+                        selector_n_seq = mg_cap;
+                    }
                     }
                 }
             }
@@ -8235,6 +8254,22 @@ static bool selector_choose_policy(
             }
         }
         const bool honor_eval_batch_first = selector_eval_batch_override > 0;
+#if defined(GGML_USE_CUDA)
+        // Free VRAM on the tightest device after a context creation.
+        auto stageb_min_free_gib = []() -> double {
+            double mn = std::numeric_limits<double>::max();
+            const int ndev = ggml_backend_cuda_get_device_count();
+            for (int d = 0; d < ndev; ++d) {
+                size_t f = 0, t = 0;
+                ggml_backend_cuda_get_device_memory(d, &f, &t);
+                const double g = (double) f / (1024.0 * 1024.0 * 1024.0);
+                if (g < mn) {
+                    mn = g;
+                }
+            }
+            return mn;
+        };
+#endif
         for (size_t ci = 0; ci < n_seq_candidates.size(); ++ci) {
             const int try_n_seq = n_seq_candidates[ci];
             params.n_ctx = kld.n_ctx * try_n_seq;
@@ -8247,12 +8282,49 @@ static bool selector_choose_policy(
             params.n_parallel = try_n_seq;
             init_res = common_init_from_params(params);
             if (init_res) {
+#if defined(GGML_USE_CUDA)
+                // Context created, but eval-time scratch buffers need headroom on
+                // every device. If the tightest device is below the eval reserve,
+                // shrink n_seq further instead of risking an eval-time cudaMalloc
+                // OOM (the 27B / 43-23 failure). At n_seq=1 with still-insufficient
+                // headroom the tensor_split is unbalanced -> fall back to proxy.
+                const double tight_free = stageb_min_free_gib();
+                if (tight_free >= SELECTOR_STAGEB_EVAL_RESERVE_GIB) {
+                    if (try_n_seq != selector_n_seq) {
+                        fprintf(stderr,
+                            "%s: selector stage-b context recovered with reduced n_seq=%d (auto=%d)\n",
+                            __func__, try_n_seq, selector_n_seq);
+                    }
+                    break;
+                }
+                if (try_n_seq == 1) {
+                    fprintf(stderr,
+                        "%s: selector stage-b n_seq=1 leaves only %.2f GiB free on tightest device (< %.2f GiB eval reserve); tensor_split unbalanced, falling back to proxy evaluation\n",
+                        __func__, tight_free, (double) SELECTOR_STAGEB_EVAL_RESERVE_GIB);
+                    const int ndev = ggml_backend_cuda_get_device_count();
+                    for (int d = 0; d < ndev; ++d) {
+                        selector_reset_cuda_device(d);
+                    }
+                    init_res.reset();
+                    break;
+                }
+                fprintf(stderr,
+                    "%s: selector stage-b n_seq=%d leaves only %.2f GiB free on tightest device (< %.2f GiB eval reserve); retrying with smaller n_seq\n",
+                    __func__, try_n_seq, tight_free, (double) SELECTOR_STAGEB_EVAL_RESERVE_GIB);
+                const int ndev = ggml_backend_cuda_get_device_count();
+                for (int d = 0; d < ndev; ++d) {
+                    selector_reset_cuda_device(d);
+                }
+                init_res.reset();
+                continue;
+#else
                 if (try_n_seq != selector_n_seq) {
                     fprintf(stderr,
                         "%s: selector stage-b context recovered with reduced n_seq=%d (auto=%d)\n",
                         __func__, try_n_seq, selector_n_seq);
                 }
                 break;
+#endif
             }
             fprintf(stderr,
                 "%s: selector stage-b context creation failed at n_seq=%d%s\n",
@@ -8284,19 +8356,33 @@ static bool selector_choose_policy(
         const int ndev = ggml_backend_cuda_get_device_count();
         fprintf(stderr,
             "%s: selector stage-b CUDA memory after checkpoint load (n_seq=%d):\n",
-            __func__, selector_n_seq);
+            __func__, (int) params.n_parallel);
+        double min_free = std::numeric_limits<double>::max();
+        int min_dev = 0;
         for (int d = 0; d < ndev; ++d) {
             size_t cuda_free = 0;
             size_t cuda_total = 0;
             ggml_backend_cuda_get_device_memory(d, &cuda_free, &cuda_total);
+            const double g = (double) cuda_free / (1024.0 * 1024.0 * 1024.0);
+            if (g < min_free) {
+                min_free = g;
+                min_dev = d;
+            }
             fprintf(stderr,
                 "%s:   CUDA%-2d after  load: free=%.2f GiB total=%.2f GiB used=%.2f GiB (%.1f%%)\n",
                 __func__,
                 d,
-                (double) cuda_free / (1024.0 * 1024.0 * 1024.0),
+                g,
                 (double) cuda_total / (1024.0 * 1024.0 * 1024.0),
                 (double) (cuda_total - cuda_free) / (1024.0 * 1024.0 * 1024.0),
                 100.0 * (double) (cuda_total - cuda_free) / (double) std::max<size_t>(1, cuda_total));
+        }
+        if (min_free < SELECTOR_STAGEB_EVAL_RESERVE_GIB) {
+            fprintf(stderr,
+                "%s: WARNING selector stage-b device CUDA%d has only %.2f GiB free after load (< %.2f GiB eval reserve); tensor_split may be unbalanced, prefer a split leaving >= %.2f GiB on every device\n",
+                __func__, min_dev, min_free,
+                (double) SELECTOR_STAGEB_EVAL_RESERVE_GIB,
+                (double) SELECTOR_STAGEB_EVAL_RESERVE_GIB);
         }
     }
 #endif

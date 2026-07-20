@@ -94,9 +94,12 @@ Selector runtime context sizing (advanced-gguf-quantizer only):
 - `selector.n_seq`: optional parallel KLD evaluation sequence count. Leave blank
   for the auto value. The auto value is tuned for throughput, but on multi-GPU
   it is additionally capped by the tightest per-device VRAM budget (model split
-  plus the n_seq-scaled graph compute buffer). If context creation still fails,
-  the loader retries with a halved `n_seq` down to 1 before falling back to
-  proxy-only selection. Set this only to force a specific value.
+  plus the n_seq-scaled graph compute buffer and recurrent-state buffer). After
+  the context is created the loader checks that every device keeps at least the
+  eval reserve (~2 GiB) free for tensor-eval scratch; if not, `n_seq` is shrunk
+  further (and the run falls back to proxy-only selection only if even `n_seq=1`
+  cannot keep the reserve, i.e. the `tensor_split` is unbalanced). Set this only
+  to force a specific value.
 - `selector.eval_batch`: optional override for the selector calibration
   micro-batch (`n_batch`/`n_ubatch`). Leave blank to use the auto value
   (`n_ctx`). A smaller value bounds the activation buffer on small GPUs.
@@ -110,7 +113,12 @@ Selector runtime context sizing (advanced-gguf-quantizer only):
   proportionally to these weights, instead of the default free-memory split
   which can produce uneven VRAM distribution (one GPU holding the lm_head
   logits buffer becoming much heavier). Leave blank for the default
-  free-memory split.
+  free-memory split. Whichever device gets the larger weight share must also
+  hold the recurrent-state buffer and its share of the compute buffer; if the
+  split leaves any device below the eval reserve after load, the loader shrinks
+  `n_seq` and, when even `n_seq=1` is insufficient, warns that the split is
+  unbalanced and falls back to proxy-only selection. Favour a split that leaves
+  roughly equal free VRAM on every device.
 - `selector.verbosity`: optional debug verbosity for the selector calibration
   context load. Set to `3` (INFO) or higher to surface llama.cpp's per-device
   compute buffer and KV buffer size lines, which show exactly how VRAM is
