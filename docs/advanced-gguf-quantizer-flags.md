@@ -128,6 +128,13 @@ Selector runtime context sizing (advanced-gguf-quantizer only):
   so it survives checkpoint size changes. Off by default; enable it for large
   models (e.g. 27B) instead of hand-tuning `tensor_split`. It adds one probe
   model load per checkpoint.
+- `selector.eval_rows`: optional cap on the number of rows evaluated per tensor
+  during selector runtime KLD evaluation. By default every tensor is evaluated
+  over all its rows; for a 27B output layer (`blk.64`, 5120 rows) this allocates
+  a `n_eval * n_vocab * 2` base-logits buffer (~2.5 GiB) on the output device,
+  which can OOM on 16 GiB cards even with a balanced split. Set this (e.g.
+  `1024`) to cap the per-tensor eval budget and fit smaller GPUs; fewer rows
+  slightly reduce KLD sample accuracy.
 - `selector.verbosity`: optional debug verbosity for the selector calibration
   context load. Set to `3` (INFO) or higher to surface llama.cpp's per-device
   compute buffer and KV buffer size lines, which show exactly how VRAM is

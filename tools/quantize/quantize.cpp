@@ -5135,6 +5135,17 @@ static bool nvfp4_selector_quantize_binding(
         bool eval_bf16 = source_view.raw_bf16;
         float eval_x_scale = tuned_x_scale;
         int64_t eval_nrow = nrows;
+        {
+            // Cap the number of rows evaluated per tensor so the KLD base-logits
+            // buffer (n_eval * n_vocab * 2 bytes, allocated on the output device)
+            // fits on smaller GPUs. The 27B output layer at full 5120 rows needs
+            // ~2.5 GiB there; lowering this (e.g. to 1024) lets it fit on 16 GiB
+            // cards. Fewer rows slightly reduce KLD sample accuracy.
+            const int64_t max_eval_rows = selector_control_i64("EVAL_ROWS", 0);
+            if (max_eval_rows > 0 && eval_nrow > max_eval_rows) {
+                eval_nrow = max_eval_rows;
+            }
+        }
         int64_t eval_n_per_row = n_per_row;
         const float * eval_qw = imatrix_slice;
 
@@ -5296,7 +5307,10 @@ static bool mxfp6_selector_quantize_binding(
         eval_params.out = direct_patch ? nullptr : out_bytes.data() + out_header_bytes + (size_t) i03 * out_slice_bytes;
         eval_params.target = direct_patch ? binding.target : nullptr;
         eval_params.slice_index = i03;
-        eval_params.nrow = nrows;
+        {
+            const int64_t max_eval_rows = selector_control_i64("EVAL_ROWS", 0);
+            eval_params.nrow = (max_eval_rows > 0 && nrows > max_eval_rows) ? max_eval_rows : nrows;
+        }
         eval_params.n_per_row = n_per_row;
         eval_params.qw = imatrix_slice;
         eval_params.weight_scale = tensor_scale;
@@ -12095,6 +12109,18 @@ int llama_quantize(int argc, char ** argv) {
         } else if (strcmp(arg_name, "--nvfp4-selector-tensor-split-auto") == 0) {
             if (arg_idx < argc-1) {
                 add_selector_control("TENSOR_SPLIT_AUTO", argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(arg_name, "--nvfp4-selector-eval-rows") == 0) {
+            if (arg_idx < argc-1) {
+                add_selector_control("EVAL_ROWS", argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(arg_name, "--selector-eval-rows") == 0) {
+            if (arg_idx < argc-1) {
+                add_selector_control("EVAL_ROWS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
