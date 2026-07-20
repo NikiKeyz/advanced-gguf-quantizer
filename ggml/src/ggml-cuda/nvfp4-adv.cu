@@ -672,9 +672,115 @@ struct nvfp4_cuda_kld_tls {
 
 static thread_local nvfp4_cuda_stream_tls      g_nvfp4_cuda_stream_tls;
 static thread_local nvfp4_cuda_autotune_tls   g_nvfp4_cuda_autotune_tls;
-static thread_local nvfp4_cuda_quant_tls      g_nvfp4_cuda_quant_tls;
-static thread_local mxfp6_e2m3_cuda_quant_tls g_mxfp6_e2m3_cuda_quant_tls;
-static thread_local nvfp4_cuda_kld_tls        g_nvfp4_cuda_kld_tls;
+
+// Per-device scratch pools. The quantize/repack, MXFP6 and KLD helpers may be
+// invoked with inputs that live on any CUDA device (multi-GPU selector runs
+// patch tensors in place on the device that owns them). Each device needs its
+// own scratch buffers because cudaMalloc binds memory to the current device,
+// so a buffer allocated while device 0 was active cannot be used by a kernel
+// running on device 1.
+static thread_local nvfp4_cuda_quant_tls      g_nvfp4_cuda_quant_tls[GGML_CUDA_MAX_DEVICES];
+static thread_local mxfp6_e2m3_cuda_quant_tls g_mxfp6_e2m3_cuda_quant_tls[GGML_CUDA_MAX_DEVICES];
+static thread_local nvfp4_cuda_kld_tls        g_nvfp4_cuda_kld_tls[GGML_CUDA_MAX_DEVICES];
+
+// Per-device internal streams. A cudaStream_t is bound to the device it was
+// created on, so the device-aware helpers below obtain a stream that belongs
+// to the device owning the inputs instead of relying on the caller's stream
+// (which is created on whatever device was current when first resolved).
+static thread_local cudaStream_t g_nvfp4_internal_stream[GGML_CUDA_MAX_DEVICES] = {};
+static thread_local bool         g_nvfp4_internal_stream_ready[GGML_CUDA_MAX_DEVICES] = {};
+
+static cudaStream_t nvfp4_cuda_internal_stream(int device) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return (cudaStream_t) 0;
+    }
+    if (!g_nvfp4_internal_stream_ready[device]) {
+        int prev = 0;
+        if (cudaGetDevice(&prev) != cudaSuccess) {
+            cudaGetLastError();
+            return (cudaStream_t) 0;
+        }
+        cudaSetDevice(device);
+        const cudaError_t err = cudaStreamCreateWithFlags(&g_nvfp4_internal_stream[device], cudaStreamNonBlocking);
+        if (err != cudaSuccess) {
+            nvfp4_cuda_log_failure("nvfp4 internal stream create", err);
+            cudaGetLastError();
+            g_nvfp4_internal_stream[device] = (cudaStream_t) 0;
+        }
+        cudaSetDevice(prev);
+        g_nvfp4_internal_stream_ready[device] = true;
+    }
+    return g_nvfp4_internal_stream[device];
+}
+
+// RAII guard that switches the current CUDA device for the scope of a
+// device-aware helper and restores it on exit. device < 0 keeps the current
+// device unchanged (single-device callers such as llama-quant manage this).
+struct nvfp4_cuda_device_scope {
+    int prev_device = 0;
+    bool active = false;
+
+    explicit nvfp4_cuda_device_scope(int device) {
+        if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+            return;
+        }
+        if (cudaGetDevice(&prev_device) != cudaSuccess) {
+            cudaGetLastError();
+            return;
+        }
+        if (device != prev_device) {
+            cudaSetDevice(device);
+        }
+        active = true;
+    }
+
+    ~nvfp4_cuda_device_scope() {
+        if (active) {
+            cudaSetDevice(prev_device);
+        }
+    }
+
+    nvfp4_cuda_device_scope(const nvfp4_cuda_device_scope &) = delete;
+    nvfp4_cuda_device_scope & operator=(const nvfp4_cuda_device_scope &) = delete;
+};
+
+// Returns the owning device for a true device pointer, or -1 for host/managed
+// pointers (which are accessible from the current device without a switch).
+static int nvfp4_cuda_device_of_ptr(const void * ptr) {
+    if (ptr == nullptr) {
+        return -1;
+    }
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 10000
+    if (attr.type != cudaMemoryTypeDevice) {
+        return -1;
+    }
+    return attr.device;
+#else
+    if (attr.memoryType != cudaMemoryTypeDevice) {
+        return -1;
+    }
+    return attr.device;
+#endif
+}
+
+// Resolve the per-device TLS slot and current device for a device-aware call.
+// target_device < 0 means "use the current device".
+static int nvfp4_cuda_tls_slot(int target_device) {
+    int slot = target_device;
+    if (slot < 0 || slot >= GGML_CUDA_MAX_DEVICES) {
+        if (cudaGetDevice(&slot) != cudaSuccess) {
+            cudaGetLastError();
+            slot = 0;
+        }
+    }
+    return slot;
+}
+
 static std::atomic<int> g_nvfp4_cuda_autotune_threads{0};
 
 extern "C" void ggml_cuda_nvfp4_set_autotune_threads(int32_t n_threads) {
@@ -682,10 +788,19 @@ extern "C" void ggml_cuda_nvfp4_set_autotune_threads(int32_t n_threads) {
 }
 
 extern "C" void ggml_cuda_nvfp4_clear_thread_cache() {
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        g_nvfp4_cuda_quant_tls[d].reset();
+        g_mxfp6_e2m3_cuda_quant_tls[d].reset();
+        g_nvfp4_cuda_kld_tls[d].reset();
+        if (g_nvfp4_internal_stream_ready[d]) {
+            if (g_nvfp4_internal_stream[d] != nullptr) {
+                cudaStreamDestroy(g_nvfp4_internal_stream[d]);
+            }
+            g_nvfp4_internal_stream[d] = nullptr;
+            g_nvfp4_internal_stream_ready[d] = false;
+        }
+    }
     g_nvfp4_cuda_autotune_tls.reset();
-    g_nvfp4_cuda_quant_tls.reset();
-    g_mxfp6_e2m3_cuda_quant_tls.reset();
-    g_nvfp4_cuda_kld_tls.reset();
     g_nvfp4_cuda_stream_tls.reset();
 }
 
@@ -3979,9 +4094,71 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
         return false;
     }
 
-    cudaStream_t st = stream ? stream : 0;
-    const bool input_device = ggml_cuda_nvfp4_device_pointer(x);
-    const bool qw_device = qw != nullptr && ggml_cuda_nvfp4_device_pointer(qw);
+    (void) stream;
+    bool input_device = ggml_cuda_nvfp4_device_pointer(x);
+    bool qw_device = qw != nullptr && ggml_cuda_nvfp4_device_pointer(qw);
+    // Autotune runs entirely on a single fixed device (0); see the device
+    // scope below. Any input that lives on another GPU is invalid there, so
+    // copy device-resident inputs to host when they are not all on device 0.
+    // Inputs already on device 0 stay resident (valid on the autotune device
+    // and used by the device gather path); host inputs need no action. This
+    // avoids allocating scratch on the sample's device and keeps the tested
+    // single-device autotune path untouched. The sample is a small statistical
+    // subset, so the host copy costs negligible memory and actually frees
+    // device-side scratch on the sample's device.
+    std::vector<float> x_host_copy;
+    std::vector<float> qw_host_copy;
+    if (input_device || qw_device) {
+        const int xdev = input_device ? nvfp4_cuda_device_of_ptr(x) : 0;
+        const int qwdev = qw_device ? nvfp4_cuda_device_of_ptr(qw) : 0;
+        // Use the device gather path only when every input is valid on device 0.
+        const bool use_device_path = input_device && xdev == 0 && (!qw_device || qwdev == 0);
+        if (!use_device_path) {
+            auto copy_one = [&](const float * src, int srcdev, std::vector<float> & buf) -> bool {
+                buf.resize((size_t) n);
+                if (srcdev >= 0) {
+                    cudaSetDevice(srcdev);
+                }
+                cudaDeviceSynchronize();
+                const cudaError_t e = cudaMemcpy(
+                    buf.data(), src, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost);
+                if (e != cudaSuccess) {
+                    cudaGetLastError();
+                    return false;
+                }
+                return true;
+            };
+            bool ok = true;
+            if (input_device) {
+                ok &= copy_one(x, xdev, x_host_copy);
+            }
+            if (qw_device) {
+                ok &= copy_one(qw, qwdev, qw_host_copy);
+            }
+            if (!ok) {
+                cudaSetDevice(0);
+                return false;
+            }
+            if (input_device) {
+                x = x_host_copy.data();
+                input_device = false;
+            }
+            if (qw_device) {
+                qw = qw_host_copy.data();
+                qw_device = false;
+            }
+        }
+    }
+
+    // Autotune derives only device-independent quantization parameters, so run
+    // it on a single fixed device (0) with that device's scratch and worker
+    // stream. This avoids reusing device-0 scratch on a non-zero GPU when the
+    // caller leaves the current device pointed at another GPU (e.g. right
+    // after a multi-GPU materialization pass), which would otherwise corrupt
+    // the device context.
+    nvfp4_cuda_device_scope dev_scope(0);
+    cudaStream_t st = nvfp4_cuda_internal_stream(0);
+
     std::vector<float> x_coarse_sample;
     std::vector<float> x_refine_sample;
     std::vector<float> qw_coarse_sample;
@@ -4803,6 +4980,7 @@ static bool ggml_cuda_nvfp4_quantize_impl(
         const nvfp4_cuda_runtime_cfg * cfg,
         nvfp4_cuda_eval_result * eval,
         cudaStream_t stream) {
+    (void) stream;
     if (nrow <= 0 || n_per_row <= 0 || (n_per_row % QK_NVFP4) != 0) {
         return false;
     }
@@ -4819,6 +4997,22 @@ static bool ggml_cuda_nvfp4_quantize_impl(
         }
     }
 
+    // Multi-GPU: route the work to the device that owns the inputs. For an
+    // in-place tensor patch the data lives on the tensor's device; for a
+    // device-resident sample it lives on the sample's device. Otherwise keep
+    // the current device (single-device callers such as llama-quant manage it).
+    int target_device = -1;
+    void * direct_tensor_data = nullptr;
+    if (direct_tensor) {
+        int tensor_device = -1;
+        if (!ggml_cuda_nvfp4_tensor_active_data(tensor, &direct_tensor_data, &tensor_device)) {
+            return false;
+        }
+        target_device = tensor_device;
+    } else if (ggml_cuda_nvfp4_device_pointer(x)) {
+        target_device = nvfp4_cuda_device_of_ptr(x);
+    }
+
     nvfp4_cuda_runtime_cfg resolved{};
     nvfp4_cuda_resolve_cfg(resolved, a, b, cfg);
     const float x_scale_eff = (isfinite(x_scale) && x_scale > 0.0f) ? x_scale : 1.0f;
@@ -4833,7 +5027,9 @@ static bool ggml_cuda_nvfp4_quantize_impl(
     const bool x_device = ggml_cuda_nvfp4_device_pointer(x);
     const bool qw_device = qw != nullptr && ggml_cuda_nvfp4_device_pointer(qw);
 
-    auto & tls = g_nvfp4_cuda_quant_tls;
+    nvfp4_cuda_device_scope dev_scope(target_device);
+    auto & tls = g_nvfp4_cuda_quant_tls[nvfp4_cuda_tls_slot(target_device)];
+    cudaStream_t st = nvfp4_cuda_internal_stream(nvfp4_cuda_tls_slot(target_device));
     if ((!x_device && !ggml_cuda_nvfp4_ensure_buf(&tls.d_x_buf, &tls.d_x_cap, bytes_x, "cudaMalloc(x)")) ||
         !ggml_cuda_nvfp4_ensure_buf((void **) &tls.d_y_buf, &tls.d_y_cap, bytes_y, "cudaMalloc(y)") ||
         (bytes_qw != 0 && !qw_device && !ggml_cuda_nvfp4_ensure_buf((void **) &tls.d_qw_buf, &tls.d_qw_cap, bytes_qw, "cudaMalloc(qw)")) ||
@@ -4841,7 +5037,6 @@ static bool ggml_cuda_nvfp4_quantize_impl(
         return false;
     }
 
-    cudaStream_t st = stream ? stream : 0;
     auto fail_quant_stream = [&](const char * label, cudaError_t status) {
         nvfp4_cuda_log_failure(label, status);
         (void) cudaStreamSynchronize(st);
@@ -4893,11 +5088,7 @@ static bool ggml_cuda_nvfp4_quantize_impl(
     }
 
     if (direct_tensor) {
-        void * tensor_data = nullptr;
-        int tensor_device = -1;
-        if (!ggml_cuda_nvfp4_tensor_active_data(tensor, &tensor_data, &tensor_device)) {
-            return false;
-        }
+        void * tensor_data = direct_tensor_data;
 
         // The tensor is already loaded in the active CUDA layout. Preserve
         // its header scale/pointer state and only replace the packed tiles.
@@ -5008,6 +5199,7 @@ extern "C" bool ggml_cuda_nvfp4_kld_reduce_tensor(
         nvfp4_cuda_kld_result * result,
         double * kld_values,
         cudaStream_t stream) {
+    (void) stream;
     if (result == nullptr) {
         return false;
     }
@@ -5036,7 +5228,16 @@ extern "C" bool ggml_cuda_nvfp4_kld_reduce_tensor(
     }
 #endif
 
-    auto & tls = g_nvfp4_cuda_kld_tls;
+    // Multi-GPU: the logits live on the device that produced the forward
+    // pass. Run the reduction on that device with its own scratch/stream.
+    const int target_device =
+#if CUDART_VERSION >= 10000
+        (logits_attr.type == cudaMemoryTypeDevice) ? logits_attr.device : -1;
+#else
+        (logits_attr.memoryType == cudaMemoryTypeDevice) ? logits_attr.device : -1;
+#endif
+    nvfp4_cuda_device_scope dev_scope(target_device);
+    auto & tls = g_nvfp4_cuda_kld_tls[nvfp4_cuda_tls_slot(target_device)];
     const size_t bytes_base = (size_t) n_eval * (size_t) nv * sizeof(uint16_t);
     const size_t bytes_tokens = (size_t) n_eval * sizeof(int32_t);
     const size_t bytes_rows = (size_t) n_eval * sizeof(nvfp4_cuda_kld_row_result);
@@ -5048,7 +5249,7 @@ extern "C" bool ggml_cuda_nvfp4_kld_reduce_tensor(
         return false;
     }
 
-    cudaStream_t st = stream ? stream : 0;
+    cudaStream_t st = nvfp4_cuda_internal_stream(nvfp4_cuda_tls_slot(target_device));
     auto fail_kld_stream = [&](const char * label, cudaError_t status) {
         nvfp4_cuda_log_failure(label, status);
         (void) cudaStreamSynchronize(st);
@@ -5265,11 +5466,17 @@ extern "C" bool ggml_cuda_tensor_snapshot_impl(
         size_t nbytes,
         void ** snapshot,
         cudaStream_t stream) {
+    (void) stream;
     void * tensor_data = nullptr;
+    int tensor_device = -1;
     if (tensor == nullptr || snapshot == nullptr || nbytes == 0 ||
-            !ggml_cuda_nvfp4_tensor_active_data(const_cast<ggml_tensor *>(tensor), &tensor_data, nullptr)) {
+            !ggml_cuda_nvfp4_tensor_active_data(const_cast<ggml_tensor *>(tensor), &tensor_data, &tensor_device)) {
         return false;
     }
+
+    // Multi-GPU: the snapshot must live on the same device as the tensor.
+    nvfp4_cuda_device_scope dev_scope(tensor_device);
+    cudaStream_t st = nvfp4_cuda_internal_stream(nvfp4_cuda_tls_slot(tensor_device));
 
     size_t free_bytes = 0;
     size_t total_bytes = 0;
@@ -5290,7 +5497,6 @@ extern "C" bool ggml_cuda_tensor_snapshot_impl(
         return false;
     }
 
-    cudaStream_t st = stream ? stream : 0;
     err = cudaMemcpyAsync(tmp, tensor_data, nbytes, cudaMemcpyDeviceToDevice, st);
     if (err != cudaSuccess) {
         cudaGetLastError();
@@ -5313,13 +5519,18 @@ extern "C" bool ggml_cuda_tensor_restore_impl(
         const void * snapshot,
         size_t nbytes,
         cudaStream_t stream) {
+    (void) stream;
     void * tensor_data = nullptr;
+    int tensor_device = -1;
     if (tensor == nullptr || snapshot == nullptr || nbytes == 0 ||
-            !ggml_cuda_nvfp4_tensor_active_data(tensor, &tensor_data, nullptr) ||
+            !ggml_cuda_nvfp4_tensor_active_data(tensor, &tensor_data, &tensor_device) ||
             !ggml_cuda_nvfp4_device_pointer(snapshot)) {
         return false;
     }
-    cudaStream_t st = stream ? stream : 0;
+
+    // Multi-GPU: restore on the device that owns the tensor and the snapshot.
+    nvfp4_cuda_device_scope dev_scope(tensor_device);
+    cudaStream_t st = nvfp4_cuda_internal_stream(nvfp4_cuda_tls_slot(tensor_device));
     cudaError_t err = cudaMemcpyAsync(tensor_data, snapshot, nbytes, cudaMemcpyDeviceToDevice, st);
     if (err != cudaSuccess) {
         cudaGetLastError();
@@ -5335,6 +5546,14 @@ extern "C" bool ggml_cuda_tensor_restore_impl(
 
 extern "C" void ggml_cuda_tensor_snapshot_free_impl(void * snapshot) {
     if (snapshot != nullptr) {
+        // Free on the device that owns the snapshot (multi-GPU).
+        const int dev = nvfp4_cuda_device_of_ptr(snapshot);
+        if (dev >= 0) {
+            int cur = 0;
+            if (cudaGetDevice(&cur) == cudaSuccess && dev != cur) {
+                cudaSetDevice(dev);
+            }
+        }
         cudaFree(snapshot);
     }
 }
@@ -5353,6 +5572,7 @@ static bool ggml_cuda_mxfp6_e2m3_quantize_eval_impl(
         float header_input_scale,
         nvfp4_cuda_eval_result * eval,
         cudaStream_t stream) {
+    (void) stream;
     const bool direct_tensor = tensor != nullptr;
     if (nrow <= 0 || n_per_row <= 0 ||
             (nrow % MXFP6_E2M3_TILE_ROWS) != 0 ||
@@ -5372,6 +5592,19 @@ static bool ggml_cuda_mxfp6_e2m3_quantize_eval_impl(
         }
     }
 
+    // Multi-GPU: an in-place MXFP6 patch writes into the tensor on the device
+    // that owns it. Sample evaluation uses a host sample, so it stays on the
+    // current device.
+    int target_device = -1;
+    void * direct_tensor_data = nullptr;
+    if (direct_tensor) {
+        int tensor_device = -1;
+        if (!ggml_cuda_nvfp4_tensor_active_data(tensor, &direct_tensor_data, &tensor_device)) {
+            return false;
+        }
+        target_device = tensor_device;
+    }
+
     const float x_scale_eff = (isfinite(x_scale) && x_scale > 0.0f) ? x_scale : 1.0f;
     const int64_t row_blocks = n_per_row / QK_MXFP6_E2M3;
     const int64_t nb_total = nrow * row_blocks;
@@ -5381,7 +5614,8 @@ static bool ggml_cuda_mxfp6_e2m3_quantize_eval_impl(
     const size_t bytes_compact = (size_t) nb_total * sizeof(block_mxfp6_e2m3);
     const size_t bytes_y = (size_t) nrow * ggml_row_size(GGML_TYPE_MXFP6_E2M3, n_per_row);
 
-    auto & tls = g_mxfp6_e2m3_cuda_quant_tls;
+    nvfp4_cuda_device_scope dev_scope(target_device);
+    auto & tls = g_mxfp6_e2m3_cuda_quant_tls[nvfp4_cuda_tls_slot(target_device)];
     if (!ggml_cuda_nvfp4_ensure_buf(&tls.d_x_buf, &tls.d_x_cap, bytes_x, "cudaMalloc(mx6 x)") ||
         !ggml_cuda_nvfp4_ensure_buf((void **) &tls.d_compact_buf, &tls.d_compact_cap, bytes_compact, "cudaMalloc(mx6 compact)") ||
         !ggml_cuda_nvfp4_ensure_buf((void **) &tls.d_y_buf, &tls.d_y_cap, bytes_y, "cudaMalloc(mx6 y)") ||
@@ -5390,7 +5624,7 @@ static bool ggml_cuda_mxfp6_e2m3_quantize_eval_impl(
         return false;
     }
 
-    cudaStream_t st = stream ? stream : 0;
+    cudaStream_t st = nvfp4_cuda_internal_stream(nvfp4_cuda_tls_slot(target_device));
     auto fail_quant_stream = [&](const char * label, cudaError_t status) {
         nvfp4_cuda_log_failure(label, status);
         (void) cudaStreamSynchronize(st);
@@ -5444,11 +5678,7 @@ static bool ggml_cuda_mxfp6_e2m3_quantize_eval_impl(
     }
 
     if (direct_tensor) {
-        void * tensor_data = nullptr;
-        int tensor_device = -1;
-        if (!ggml_cuda_nvfp4_tensor_active_data(tensor, &tensor_data, &tensor_device)) {
-            return false;
-        }
+        void * tensor_data = direct_tensor_data;
 
         // Preserve the loaded runtime header pointer fields.  Direct selector
         // patching only needs to update scalar fallbacks; vector scales are
