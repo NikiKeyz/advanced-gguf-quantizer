@@ -5467,49 +5467,115 @@ extern "C" bool ggml_cuda_tensor_snapshot_impl(
         void ** snapshot,
         cudaStream_t stream) {
     (void) stream;
-    void * tensor_data = nullptr;
-    int tensor_device = -1;
-    if (tensor == nullptr || snapshot == nullptr || nbytes == 0 ||
-            !ggml_cuda_nvfp4_tensor_active_data(const_cast<ggml_tensor *>(tensor), &tensor_data, &tensor_device)) {
+    if (tensor == nullptr || snapshot == nullptr || nbytes == 0) {
         return false;
     }
 
-    // Multi-GPU: the snapshot must live on the same device as the tensor.
-    nvfp4_cuda_device_scope dev_scope(tensor_device);
-    cudaStream_t st = nvfp4_cuda_internal_stream(nvfp4_cuda_tls_slot(tensor_device));
-
-    size_t free_bytes = 0;
-    size_t total_bytes = 0;
-    cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
-    if (err == cudaSuccess) {
+    // The snapshot must live on the same device as the tensor (multi-GPU safe).
+    auto snapshot_reserve_ok = [&](int dev) -> bool {
+        nvfp4_cuda_device_scope dev_scope(dev);
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            return true;
+        }
         const size_t reserve_bytes = std::max<size_t>(total_bytes / 8, (size_t) 512 * 1024 * 1024);
-        if (free_bytes <= nbytes + reserve_bytes) {
+        return free_bytes > nbytes + reserve_bytes;
+    };
+    auto snapshot_alloc = [&](int dev) -> void * {
+        nvfp4_cuda_device_scope dev_scope(dev);
+        void * tmp = nullptr;
+        cudaError_t err = cudaMalloc(&tmp, nbytes);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            return nullptr;
+        }
+        return tmp;
+    };
+    auto buffer_device = [&](const ggml_tensor * t, int & dev) -> bool {
+        dev = -1;
+        if (t->buffer == nullptr) {
             return false;
         }
-    } else {
+        void * base = ggml_backend_buffer_get_base(t->buffer);
+        cudaPointerAttributes attr{};
+        if (cudaPointerGetAttributes(&attr, base) == cudaSuccess && attr.type == cudaMemoryTypeDevice) {
+            dev = attr.device;
+            return true;
+        }
         cudaGetLastError();
+        cudaGetDevice(&dev);
+        return dev >= 0;
+    };
+
+    void * tensor_data = nullptr;
+    int tensor_device = -1;
+    if (ggml_cuda_nvfp4_tensor_active_data(const_cast<ggml_tensor *>(tensor), &tensor_data, &tensor_device)) {
+        // Fast path: direct device-to-device copy of the active device data.
+        if (!snapshot_reserve_ok(tensor_device)) {
+            return false;
+        }
+        void * tmp = snapshot_alloc(tensor_device);
+        if (tmp == nullptr) {
+            return false;
+        }
+        nvfp4_cuda_device_scope dev_scope(tensor_device);
+        cudaStream_t st = nvfp4_cuda_internal_stream(nvfp4_cuda_tls_slot(tensor_device));
+        cudaError_t err = cudaMemcpyAsync(tmp, tensor_data, nbytes, cudaMemcpyDeviceToDevice, st);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            cudaFree(tmp);
+            return false;
+        }
+        err = cudaStreamSynchronize(st);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            cudaFree(tmp);
+            return false;
+        }
+        *snapshot = tmp;
+        return true;
     }
 
-    void * tmp = nullptr;
-    err = cudaMalloc(&tmp, nbytes);
-    if (err != cudaSuccess) {
-        cudaGetLastError();
+    // Fallback for tensor types whose active device pointer is not exposed by
+    // ggml_cuda_nvfp4_tensor_active_data (e.g. MXFP6_E2M3). Snapshot the tensor
+    // through the ggml backend buffer into a device allocation. The host staging
+    // copy is transient (freed immediately), so the original weights stay on the
+    // GPU and out of host RAM.
+    int buf_device = -1;
+    if (!buffer_device(tensor, buf_device)) {
         return false;
     }
-
-    err = cudaMemcpyAsync(tmp, tensor_data, nbytes, cudaMemcpyDeviceToDevice, st);
-    if (err != cudaSuccess) {
-        cudaGetLastError();
-        cudaFree(tmp);
+    if (ggml_backend_buffer_is_host(tensor->buffer)) {
         return false;
     }
-    err = cudaStreamSynchronize(st);
-    if (err != cudaSuccess) {
-        cudaGetLastError();
-        cudaFree(tmp);
+    if (!snapshot_reserve_ok(buf_device)) {
         return false;
     }
-
+    void * tmp = snapshot_alloc(buf_device);
+    if (tmp == nullptr) {
+        return false;
+    }
+    {
+        nvfp4_cuda_device_scope dev_scope(buf_device);
+        cudaStream_t st = nvfp4_cuda_internal_stream(nvfp4_cuda_tls_slot(buf_device));
+        std::vector<uint8_t> staging(nbytes);
+        ggml_backend_tensor_get(const_cast<ggml_tensor *>(tensor), staging.data(), 0, nbytes);
+        cudaError_t err = cudaMemcpyAsync(tmp, staging.data(), nbytes, cudaMemcpyHostToDevice, st);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            cudaFree(tmp);
+            return false;
+        }
+        err = cudaStreamSynchronize(st);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            cudaFree(tmp);
+            return false;
+        }
+    }
     *snapshot = tmp;
     return true;
 }
@@ -5520,18 +5586,52 @@ extern "C" bool ggml_cuda_tensor_restore_impl(
         size_t nbytes,
         cudaStream_t stream) {
     (void) stream;
-    void * tensor_data = nullptr;
-    int tensor_device = -1;
-    if (tensor == nullptr || snapshot == nullptr || nbytes == 0 ||
-            !ggml_cuda_nvfp4_tensor_active_data(tensor, &tensor_data, &tensor_device) ||
-            !ggml_cuda_nvfp4_device_pointer(snapshot)) {
+    if (tensor == nullptr || snapshot == nullptr || nbytes == 0) {
         return false;
     }
 
-    // Multi-GPU: restore on the device that owns the tensor and the snapshot.
-    nvfp4_cuda_device_scope dev_scope(tensor_device);
-    cudaStream_t st = nvfp4_cuda_internal_stream(nvfp4_cuda_tls_slot(tensor_device));
-    cudaError_t err = cudaMemcpyAsync(tensor_data, snapshot, nbytes, cudaMemcpyDeviceToDevice, st);
+    void * tensor_data = nullptr;
+    int tensor_device = -1;
+    if (ggml_cuda_nvfp4_tensor_active_data(tensor, &tensor_data, &tensor_device) &&
+            ggml_cuda_nvfp4_device_pointer(snapshot)) {
+        // Fast path: direct device-to-device copy of the active device data.
+        nvfp4_cuda_device_scope dev_scope(tensor_device);
+        cudaStream_t st = nvfp4_cuda_internal_stream(nvfp4_cuda_tls_slot(tensor_device));
+        cudaError_t err = cudaMemcpyAsync(tensor_data, snapshot, nbytes, cudaMemcpyDeviceToDevice, st);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        err = cudaStreamSynchronize(st);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        return true;
+    }
+
+    // Fallback: restore through the ggml backend buffer (transient host staging).
+    int buf_device = -1;
+    if (tensor->buffer == nullptr || ggml_backend_buffer_is_host(tensor->buffer)) {
+        return false;
+    }
+    {
+        void * base = ggml_backend_buffer_get_base(tensor->buffer);
+        cudaPointerAttributes attr{};
+        if (cudaPointerGetAttributes(&attr, base) == cudaSuccess && attr.type == cudaMemoryTypeDevice) {
+            buf_device = attr.device;
+        } else {
+            cudaGetLastError();
+            cudaGetDevice(&buf_device);
+        }
+    }
+    if (buf_device < 0) {
+        return false;
+    }
+    nvfp4_cuda_device_scope dev_scope(buf_device);
+    cudaStream_t st = nvfp4_cuda_internal_stream(nvfp4_cuda_tls_slot(buf_device));
+    std::vector<uint8_t> staging(nbytes);
+    cudaError_t err = cudaMemcpyAsync(staging.data(), snapshot, nbytes, cudaMemcpyDeviceToHost, st);
     if (err != cudaSuccess) {
         cudaGetLastError();
         return false;
@@ -5541,6 +5641,7 @@ extern "C" bool ggml_cuda_tensor_restore_impl(
         cudaGetLastError();
         return false;
     }
+    ggml_backend_tensor_set(tensor, staging.data(), 0, nbytes);
     return true;
 }
 

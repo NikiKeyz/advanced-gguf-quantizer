@@ -3565,9 +3565,10 @@ static bool quantize_binding_ensure_target_bytes(selector_binding & binding) {
 
     // Try to capture a GPU-side snapshot of the original tensor. restore_all() uses it
     // to undo candidate patches, so stage-b avoids a full host-RAM copy of every
-    // tensor's weights. NVFP4 supports this snapshot; MXFP6_E2M3 may not on some setups
-    // (ggml_cuda_tensor_snapshot needs an active device pointer the MXFP6 path does not
-    // expose), in which case we fall back to a host copy below.
+    // tensor's weights. ggml_cuda_tensor_snapshot supports both NVFP4 (active device
+    // pointer) and MXFP6_E2M3 (via the ggml backend buffer fallback), so the original
+    // weights stay in VRAM. The host copy below remains only a last-resort fallback if
+    // a device snapshot cannot be taken (e.g. VRAM pressure).
     if (!binding.original_target_device.valid_for(binding.target_nbytes)) {
         (void) binding.original_target_device.capture(binding.target, binding.target_nbytes);
     }
