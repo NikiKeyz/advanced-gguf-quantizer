@@ -11927,6 +11927,12 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
+        } else if (strcmp(arg_name, "--nvfp4-selector-mxfp6-file-restore") == 0) {
+            if (arg_idx < argc-1) {
+                add_selector_control("MXFP6_FILE_RESTORE", argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
         } else if (strcmp(arg_name, "--nvfp4-selector-sensitivity-report") == 0) {
             if (arg_idx < argc-1) {
                 add_selector_control("SENSITIVITY_REPORT_FILE", argv[++arg_idx]);

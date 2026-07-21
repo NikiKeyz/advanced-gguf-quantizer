@@ -295,6 +295,7 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "selector.tensor_split") { r.selector.tensor_split = value; return; }
     if (path == "selector.eval_rows") { r.selector.eval_rows = value; return; }
     if (path == "selector.verbosity") { r.selector.verbosity = value; return; }
+    if (path == "selector.mxfp6_file_restore") { r.selector.mxfp6_file_restore = value; return; }
     if (path == "selector.sensitivity_report") { r.selector.sensitivity_report = value; return; }
     if (path == "selector.sensitivity_top") { r.selector.sensitivity_top = value; return; }
     if (path == "selector.sensitivity_layer") { r.selector.sensitivity_layer = value; return; }
@@ -1014,6 +1015,7 @@ std::string dump_recipe_toml(const Recipe & r) {
         dump_string(out, "tensor_split", r.selector.tensor_split);
         dump_string(out, "eval_rows", r.selector.eval_rows);
         dump_string(out, "verbosity", r.selector.verbosity);
+        dump_string(out, "mxfp6_file_restore", r.selector.mxfp6_file_restore);
     }
     dump_string(out, "sensitivity_report", r.selector.sensitivity_report);
     dump_string(out, "sensitivity_top", r.selector.sensitivity_top);
@@ -1503,6 +1505,7 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
         push_pair("--nvfp4-selector-eval-rows", r.selector.eval_rows);
     }
     push_pair("--selector-verbosity", r.selector.verbosity);
+    push_pair("--selector-mxfp6-file-restore", r.selector.mxfp6_file_restore);
     push_pair("--selector-sensitivity-report", r.selector.sensitivity_report);
     push_pair("--selector-sensitivity-top", r.selector.sensitivity_top);
     push_pair("--selector-sensitivity-layer", r.selector.sensitivity_layer);

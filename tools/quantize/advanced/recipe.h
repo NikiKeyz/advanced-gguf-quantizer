@@ -188,6 +188,7 @@ struct Recipe {
         std::string tensor_split;
         std::string eval_rows;
         std::string verbosity;
+        std::string mxfp6_file_restore;
         std::string sensitivity_report;
         std::string sensitivity_top;
         std::string sensitivity_layer;
