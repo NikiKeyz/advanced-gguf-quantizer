@@ -8605,6 +8605,7 @@ static bool selector_choose_policy(
                     }
                 }
             };
+            size_t direct_patch_count = 0;
             auto patch_policy_once = [&](int attempt, size_t & failed_pos) -> bool {
                 failed_pos = no_failed_patch;
                 for (auto & r : patch_results) {
@@ -8654,6 +8655,51 @@ static bool selector_choose_policy(
                         patch_detail(state, pos));
                     update_full_quant_eta("selector-stage-b-policy-patch");
                 };
+                // Applies one quantized candidate to its runtime tensor and frees the
+                // host staging buffer immediately. Applying per tensor (instead of
+                // quantizing the whole policy first and applying afterwards) bounds the
+                // peak host RAM to roughly one window of candidate buffers, which matters
+                // for large candidate types (BF16/F16/Q8_0) on small-RAM machines.
+                auto apply_patch = [&](size_t pos) -> bool {
+                    auto & b = all_bindings[eval_binding_indices[pos]];
+                    const auto & r = patch_results[pos];
+                    if (!r.ok) {
+                        fprintf(stderr,
+                            "%s: selector rejected policy=%s during stage-b tensor=%s after quantize failure\n",
+                            __func__, policy.name.c_str(), b.name.c_str());
+                        return false;
+                    }
+                    direct_patch_count += r.direct_applied ? 1 : 0;
+                    float header_weight_scale = 1.0f;
+                    float header_input_scale = 1.0f;
+                    if (!nvfp4_selector_prepare_nvfp4_runtime_scales(
+                            b, nvfp4_input_scale_policy, &header_weight_scale, &header_input_scale)) {
+                        return false;
+                    }
+                    if (b.target_scale != nullptr &&
+                            !quantize_tensor_copy_in(b.target_scale, b.working_scale_bytes.data(), b.target_scale_nbytes)) {
+                        return false;
+                    }
+                    if (b.target_input_scale != nullptr &&
+                            !quantize_tensor_copy_in(
+                                b.target_input_scale,
+                                b.working_input_scale_bytes.data(),
+                                b.target_input_scale_nbytes)) {
+                        return false;
+                    }
+                    if (r.direct_applied &&
+                            !ggml_cuda_nvfp4_tensor_set_header_scales(b.target, header_weight_scale, header_input_scale, nullptr)) {
+                        return false;
+                    }
+                    if (!r.direct_applied && !quantize_tensor_copy_in(b.target, b.working_target_bytes.data(), b.target_nbytes)) {
+                        return false;
+                    }
+                    // Release the host staging buffer now that the candidate lives on the device.
+                    b.working_target_bytes.clear();
+                    b.working_target_bytes.shrink_to_fit();
+                    return true;
+                };
+
                 patch_update("starting", no_failed_patch, true);
                 if (stageb_patch_threads <= 1 || eval_binding_indices.size() <= 1) {
                     for (size_t pos = 0; pos < eval_binding_indices.size(); ++pos) {
@@ -8666,22 +8712,31 @@ static bool selector_choose_policy(
                                     stageb_collect_patch_eval_metrics)) {
                             r.direct_applied = true;
                             patch_done_one("encoded direct", pos);
-                            continue;
-                        }
-                        if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
+                        } else if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
                                 r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false, nullptr,
                                 stageb_collect_patch_eval_metrics)) {
                             r.ok = false;
                             failed_pos = pos;
                             patch_update("failed", pos, true);
                             return false;
+                        } else {
+                            patch_done_one("encoded", pos);
                         }
-                        patch_done_one("encoded", pos);
+                        if (!apply_patch(pos)) {
+                            return false;
+                        }
                     }
                     patch_heartbeat.finish(patch_detail("complete", no_failed_patch));
                     return true;
-                } else {
-                    std::atomic<size_t> next_patch { 0 };
+                }
+                // Parallel path: bound host RAM by keeping only one window of candidate
+                // staging buffers (working_target_bytes) live at a time. Quantize a window
+                // in parallel, then apply (copy-in + release) it serially before the next.
+                const size_t patch_window = (size_t) std::max<int64_t>(1,
+                    selector_control_i64("PATCH_WINDOW", 16));
+                for (size_t wlo = 0; wlo < eval_binding_indices.size(); wlo += patch_window) {
+                    const size_t whi = std::min(wlo + patch_window, eval_binding_indices.size());
+                    std::atomic<size_t> next_patch { wlo };
                     std::atomic<size_t> failed_patch { no_failed_patch };
                     std::atomic<bool> patch_failed { false };
                     std::vector<std::thread> workers;
@@ -8693,7 +8748,7 @@ static bool selector_choose_policy(
                                     break;
                                 }
                                 const size_t pos = next_patch.fetch_add(1, std::memory_order_relaxed);
-                                if (pos >= eval_binding_indices.size()) {
+                                if (pos >= whi) {
                                     break;
                                 }
                                 auto & b = all_bindings[eval_binding_indices[pos]];
@@ -8711,12 +8766,10 @@ static bool selector_choose_policy(
                                         r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false, nullptr,
                                         stageb_collect_patch_eval_metrics)) {
                                     r.ok = false;
-                                    size_t expected = no_failed_patch;
-                                    (void) failed_patch.compare_exchange_strong(
-                                        expected, pos, std::memory_order_acq_rel, std::memory_order_acquire);
+                                    failed_patch.store(pos, std::memory_order_release);
                                     patch_failed.store(true, std::memory_order_release);
                                     patch_update("failed", pos, true);
-                                    continue;
+                                    return;
                                 }
                                 patch_done_one("encoded", pos);
                             }
@@ -8725,8 +8778,8 @@ static bool selector_choose_policy(
                     for (auto & worker : workers) {
                         worker.join();
                     }
-                    failed_pos = failed_patch.load(std::memory_order_acquire);
-                    if (failed_pos != no_failed_patch) {
+                    if (patch_failed.load(std::memory_order_acquire)) {
+                        failed_pos = failed_patch.load(std::memory_order_acquire);
                         auto & b = all_bindings[eval_binding_indices[failed_pos]];
                         fprintf(stderr,
                             "%s: selector stage-b patch attempt=%d failed policy=%s tensor=%s; stopped remaining workers\n",
@@ -8734,9 +8787,14 @@ static bool selector_choose_policy(
                         patch_update("failed", failed_pos, true);
                         return false;
                     }
-                    patch_heartbeat.finish(patch_detail("complete", no_failed_patch));
-                    return true;
+                    for (size_t pos = wlo; pos < whi; ++pos) {
+                        if (!apply_patch(pos)) {
+                            return false;
+                        }
+                    }
                 }
+                patch_heartbeat.finish(patch_detail("complete", no_failed_patch));
+                return true;
             };
             const std::string stageb_binding_threads_text = std::to_string(stageb_binding_nthread);
             // Stage-B has already split nthread across patch workers; keep a
@@ -8770,53 +8828,9 @@ static bool selector_choose_policy(
                 }
             }
             const auto patch_quant_t1 = std::chrono::steady_clock::now();
-            size_t direct_patch_count = 0;
             size_t direct_fallback_count = 0;
             if (!stageb_patch_quant_ok) {
                 policy_patch_ok = false;
-            }
-            for (size_t pos = 0; policy_patch_ok && pos < eval_binding_indices.size(); ++pos) {
-                auto & b = all_bindings[eval_binding_indices[pos]];
-                const auto & r = patch_results[pos];
-                if (!r.ok) {
-                    fprintf(stderr, "%s: selector rejected policy=%s during stage-b tensor=%s after quantize failure\n",
-                        __func__, policy.name.c_str(), b.name.c_str());
-                    policy_patch_ok = false;
-                    break;
-                }
-                direct_patch_count += r.direct_applied ? 1 : 0;
-                float header_weight_scale = 1.0f;
-                float header_input_scale = 1.0f;
-                if (!nvfp4_selector_prepare_nvfp4_runtime_scales(
-                        b, nvfp4_input_scale_policy, &header_weight_scale, &header_input_scale)) {
-                    restore_all();
-                    return false;
-                }
-                if (b.target_scale != nullptr &&
-                        !quantize_tensor_copy_in(b.target_scale, b.working_scale_bytes.data(), b.target_scale_nbytes)) {
-                    restore_all();
-                    return false;
-                }
-                if (b.target_input_scale != nullptr &&
-                        !quantize_tensor_copy_in(
-                            b.target_input_scale,
-                            b.working_input_scale_bytes.data(),
-                            b.target_input_scale_nbytes)) {
-                    restore_all();
-                    return false;
-                }
-                if (r.direct_applied &&
-                        !ggml_cuda_nvfp4_tensor_set_header_scales(b.target, header_weight_scale, header_input_scale, nullptr)) {
-                    restore_all();
-                    return false;
-                }
-                if (!r.direct_applied && !quantize_tensor_copy_in(b.target, b.working_target_bytes.data(), b.target_nbytes)) {
-                    restore_all();
-                    return false;
-                }
-                // Release the host staging buffer now that the candidate lives on the device.
-                b.working_target_bytes.clear();
-                b.working_target_bytes.shrink_to_fit();
             }
             if (policy_patch_ok && direct_patch_count > 0 && stageb_verify_direct_patch) {
                 bool direct_verified = false;

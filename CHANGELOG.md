@@ -25,3 +25,14 @@ section collects changes not yet part of a tagged release.
   with a transient host staging copy, while the snapshot itself lives in VRAM. The
   original host-copy fallback in `quantize_binding_ensure_target_bytes` is retained as
   a last resort (e.g. VRAM pressure) but is no longer on the hot path for either type.
+
+- **selector (stage-b): bound per-policy patch RAM.** `patch_policy_once` previously
+  quantized every tensor in a policy in parallel and only then copied the candidates in,
+  so all candidate staging buffers (`working_target_bytes`) were live simultaneously.
+  For large candidate types (BF16/F16/Q8_0) this peaked at tens of GB of host RAM and
+  thrashed swap on small-RAM machines during the first real policy after the baseline.
+  Candidate staging is now applied (copy-in + free) per tensor, and the parallel path
+  quantizes and applies one window of tensors at a time. Peak host RAM is now bounded by
+  roughly `PATCH_WINDOW` (default 16, tunable via `SELECTOR_PATCH_WINDOW`) times the
+  largest single candidate tensor, instead of the whole policy at once. Behavior and
+  restore-on-failure semantics are unchanged.
