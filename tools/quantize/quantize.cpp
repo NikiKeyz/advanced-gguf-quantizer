@@ -26,6 +26,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
+#include <fcntl.h>
 #include <chrono>
 #include <condition_variable>
 #include <vector>
@@ -604,6 +606,7 @@ struct selector_binding {
     size_t target_scale_nbytes = 0;
     size_t target_input_scale_nbytes = 0;
     std::vector<uint8_t> original_target_bytes;
+    bool restore_from_file = false;
     std::vector<uint8_t> working_target_bytes;
     std::vector<uint8_t> original_scale_bytes;
     std::vector<uint8_t> working_scale_bytes;
@@ -1252,6 +1255,8 @@ private:
     bool stopping = false;
 };
 
+static void selector_log_rss(const char * label);
+
 static bool selector_eval_kld_subset(
     llama_context * ctx,
     const selector_kld_subset & kld,
@@ -1285,6 +1290,7 @@ static bool selector_eval_kld_subset(
     n_batch = std::max(1, n_batch);
     const int num_batches = (kld.n_ctx + n_batch - 1) / n_batch;
     out.collect_kld_values = collect_kld_distribution;
+    selector_log_rss("baseline-kld:entry");
     if (collect_kld_distribution) {
         out.kld_values.clear();
     }
@@ -1336,6 +1342,11 @@ static bool selector_eval_kld_subset(
         heartbeat.update(progress_done, progress_total, detail, true);
     }
     for (int ci = 0; ci < kld.n_chunk; ci += n_seq) {
+        if (ci == 0 || (ci % 64) == 0) {
+            char rss_label[64];
+            snprintf(rss_label, sizeof(rss_label), "baseline-kld:chunk-%d", ci + 1);
+            selector_log_rss(rss_label);
+        }
         const int n_seq_batch = std::min(n_seq, kld.n_chunk - ci);
         {
             char detail[160];
@@ -3583,14 +3594,20 @@ static bool quantize_binding_ensure_target_bytes(selector_binding & binding) {
         }
     }
 
-    // When no usable GPU snapshot exists (e.g. MXFP6_E2M3 here), keep a host copy of the
-    // full original tensor so restore_all() can still undo candidate patches. This bounds
-    // host RAM to only the tensor types that need it, instead of the whole checkpoint.
+    // When no usable GPU snapshot exists, keep a host copy of the full original tensor
+    // so restore_all() can still undo candidate patches. For MXFP6 on near-full VRAM
+    // the snapshot allocation often fails; when selector.MXFP6_FILE_RESTORE is enabled,
+    // fall back to reading the original data from the GGUF file during restore_all()
+    // instead, avoiding a per-tensor host copy that would sum to tens of GiB.
     if (!have_device_snapshot) {
-        if (binding.original_target_bytes.size() != binding.target_nbytes) {
-            binding.original_target_bytes.resize(binding.target_nbytes);
-            if (!quantize_tensor_copy_out(binding.target, binding.original_target_bytes.data(), binding.target_nbytes)) {
-                return false;
+        if (is_mxfp6 && selector_control_i64("MXFP6_FILE_RESTORE", 0) != 0) {
+            binding.restore_from_file = true;
+        } else {
+            if (binding.original_target_bytes.size() != binding.target_nbytes) {
+                binding.original_target_bytes.resize(binding.target_nbytes);
+                if (!quantize_tensor_copy_out(binding.target, binding.original_target_bytes.data(), binding.target_nbytes)) {
+                    return false;
+                }
             }
         }
     }
@@ -3752,6 +3769,29 @@ static bool quantize_restore_from_snapshot_or_host(
         ++counters->failed;
     }
     return false;
+}
+
+static bool quantize_restore_from_checkpoint_gguf(
+        const selector_binding & binding,
+        struct gguf_context * gguf,
+        int fd) {
+    if (fd < 0 || gguf == nullptr) {
+        return false;
+    }
+    const int64_t idx = gguf_find_tensor(gguf, binding.name.c_str());
+    if (idx < 0) {
+        return false;
+    }
+    const size_t tensor_bytes = gguf_get_tensor_size(gguf, idx);
+    if (tensor_bytes != binding.target_nbytes) {
+        return false;
+    }
+    const size_t file_off = gguf_get_data_offset(gguf) + gguf_get_tensor_offset(gguf, idx);
+    std::vector<uint8_t> buf(tensor_bytes);
+    if (pread(fd, buf.data(), tensor_bytes, file_off) != (ssize_t) tensor_bytes) {
+        return false;
+    }
+    return quantize_tensor_copy_in(binding.target, buf.data(), tensor_bytes);
 }
 
 static std::vector<std::string> selector_build_stress_tensors(
@@ -6107,6 +6147,7 @@ static bool selector_find_tensor_rescue_cfg(
     std::vector<uint8_t> tmp_bytes;
     std::vector<scored_policy> coarse_ranked;
     coarse_ranked.reserve(policies.size());
+    selector_log_rss("rescue-coarse-start");
     for (size_t i = 0; i < policies.size(); ++i) {
         double score = std::numeric_limits<double>::infinity();
         if (!score_policy(policies[i], sample_blocks, tmp_bytes, score)) {
@@ -6126,6 +6167,7 @@ static bool selector_find_tensor_rescue_cfg(
     if (coarse_ranked.empty()) {
         return false;
     }
+    selector_log_rss("rescue-coarse-end");
 
     std::sort(coarse_ranked.begin(), coarse_ranked.end(), [](const scored_policy & a, const scored_policy & b) {
         if (a.score != b.score) return a.score < b.score;
@@ -6220,6 +6262,42 @@ static bool selector_find_tensor_rescue_cfg(
     }
     out_sample_blocks = guard_blocks > refine_blocks ? guard_blocks : (refine_blocks > sample_blocks ? refine_blocks : sample_blocks);
     return std::isfinite(out_best_score);
+}
+
+static void selector_log_rss(const char * label) {
+    static const bool enabled = ([]() {
+        const char * v = std::getenv("SELECTOR_RSS_LOG");
+        return v && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    })();
+    if (!enabled) {
+        return;
+    }
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", (int) getpid());
+    std::ifstream f(path);
+    if (!f) {
+        return;
+    }
+    std::string line;
+    long anon_kib = -1, file_kib = -1, vm_kib = -1, hwm_kib = -1;
+    while (std::getline(f, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            sscanf(line.c_str(), "VmRSS: %ld kB", &vm_kib);
+        } else if (line.rfind("VmHWM:", 0) == 0) {
+            sscanf(line.c_str(), "VmHWM: %ld kB", &hwm_kib);
+        } else if (line.rfind("RssAnon:", 0) == 0) {
+            sscanf(line.c_str(), "RssAnon: %ld kB", &anon_kib);
+        } else if (line.rfind("RssFile:", 0) == 0) {
+            sscanf(line.c_str(), "RssFile: %ld kB", &file_kib);
+        }
+    }
+    fprintf(stderr,
+        "SELECTOR_RSS %s: VmRSS=%.2f GiB VmHWM=%.2f GiB RssAnon=%.2f GiB RssFile=%.2f GiB\n",
+        label,
+        vm_kib > 0 ? (double) vm_kib / (1024.0 * 1024.0) : -1.0,
+        hwm_kib > 0 ? (double) hwm_kib / (1024.0 * 1024.0) : -1.0,
+        anon_kib > 0 ? (double) anon_kib / (1024.0 * 1024.0) : -1.0,
+        file_kib > 0 ? (double) file_kib / (1024.0 * 1024.0) : -1.0);
 }
 
 static bool selector_choose_policy(
@@ -6559,6 +6637,11 @@ static bool selector_choose_policy(
         }
     }
 
+    // GGUF reader for restoring MXFP6 tensors when device snapshots failed
+    // (VRAM too tight). Opened after the runtime context is created.
+    struct gguf_context * checkpoint_gguf = nullptr;
+    int checkpoint_fd = -1;
+
     selector_restore_counters runtime_restore_counters;
     auto restore_all = [&]() {
         if (!want_measured_eval) {
@@ -6584,8 +6667,17 @@ static bool selector_choose_policy(
         }
         for (auto & b : mxfp6_bindings) {
             if (!quantize_tensor_host_buffer(b.target)) {
-                quantize_restore_from_snapshot_or_host(
-                    b.target, b.original_target_device, b.original_target_bytes, b.target_nbytes, &runtime_restore_counters);
+                if (b.restore_from_file && !b.original_target_device.valid_for(b.target_nbytes) &&
+                        b.original_target_bytes.empty() && checkpoint_fd >= 0) {
+                    if (!quantize_restore_from_checkpoint_gguf(b, checkpoint_gguf, checkpoint_fd)) {
+                        ++runtime_restore_counters.failed;
+                    } else {
+                        ++runtime_restore_counters.device;
+                    }
+                } else {
+                    quantize_restore_from_snapshot_or_host(
+                        b.target, b.original_target_device, b.original_target_bytes, b.target_nbytes, &runtime_restore_counters);
+                }
             }
             if (b.target_scale != nullptr && !quantize_tensor_host_buffer(b.target_scale)) {
                 quantize_restore_from_snapshot_or_host(
@@ -8123,10 +8215,12 @@ static bool selector_choose_policy(
             load_heartbeat->detail("loading runtime checkpoint", true);
         }
         init_res = common_init_from_params(params);
+        selector_log_rss("stage-b:after-init");
         if (load_heartbeat) {
             load_heartbeat->finish(init_res ? "runtime checkpoint loaded" : "runtime checkpoint load failed");
         }
         lctx = init_res ? init_res->context() : nullptr;
+        selector_log_rss("stage-b:after-init-context");
         if (verbosity_overridden) {
             common_log_set_verbosity_thold(saved_verbosity_thold);
         }
@@ -8152,6 +8246,31 @@ static bool selector_choose_policy(
         }
     }
 #endif
+    if (lctx != nullptr && checkpoint_fd < 0 && !checkpoint_model_path.empty() &&
+            selector_control_i64("MXFP6_FILE_RESTORE", 0) != 0) {
+        gguf_init_params gparams = { true, nullptr };
+        checkpoint_gguf = gguf_init_from_file(checkpoint_model_path.c_str(), gparams);
+        if (checkpoint_gguf == nullptr) {
+            fprintf(stderr, "%s: WARNING could not open checkpoint GGUF for MXFP6 tensor restore\n", __func__);
+        } else {
+            checkpoint_fd = open(checkpoint_model_path.c_str(), O_RDONLY);
+            if (checkpoint_fd < 0) {
+                gguf_free(checkpoint_gguf);
+                checkpoint_gguf = nullptr;
+                fprintf(stderr, "%s: WARNING could not open checkpoint file for MXFP6 tensor restore (%s)\n",
+                    __func__, strerror(errno));
+            }
+        }
+    }
+    struct checkpoint_gguf_guard {
+        struct gguf_context * & ctx;
+        int & fd;
+        ~checkpoint_gguf_guard() {
+            if (fd >= 0) { close(fd); }
+            if (ctx != nullptr) { gguf_free(ctx); }
+        }
+    } gguf_guard{checkpoint_gguf, checkpoint_fd};
+
     bool have_runtime_eval = run_stageb_eval && lctx != nullptr;
     bool have_measured_eval = stageb_cache_only_eval || have_runtime_eval;
     if (run_stageb_eval && !have_measured_eval) {
@@ -8401,6 +8520,7 @@ static bool selector_choose_policy(
                 "caching original runtime tensors");
         }
         runtime_cache_heartbeat.finish("original runtime tensors cached");
+        selector_log_rss("stage-b:after-cache");
         int64_t kld_metric_threads = selector_kld_threads_override();
         if (kld_metric_threads <= 0) {
             kld_metric_threads = std::max<unsigned int>(1, std::thread::hardware_concurrency());
@@ -8424,6 +8544,7 @@ static bool selector_choose_policy(
             baseline_holdout_eval = cached_baseline.validation;
             has_holdout_eval = cached_baseline.has_validation && baseline_holdout_eval.ok;
         } else {
+            selector_log_rss("stage-b:before-baseline-kld");
             selector_kld_metrics baseline_km;
             if (!selector_eval_kld_subset(
                     lctx, kld_budget, params.n_batch, baseline_km, true,
@@ -10195,6 +10316,7 @@ static bool selector_choose_policy(
             format_candidate_types().c_str());
         std::vector<selector_tensor_sensitivity> sens;
         sens.reserve(all_bindings.size());
+        selector_log_rss("sens-loop-start");
         for (size_t bind_i = 0; bind_i < all_bindings.size(); ++bind_i) {
             auto & b = all_bindings[bind_i];
             if (selector_trace) {
@@ -10297,6 +10419,11 @@ static bool selector_choose_policy(
                 selector_type_quality_gain(GGML_TYPE_BF16),
                 rescue_speed_weight);
             sens.push_back(std::move(s));
+            if ((bind_i & 63) == 0 || bind_i + 1 == all_bindings.size()) {
+                char label[64];
+                snprintf(label, sizeof(label), "sens-loop-%zu/%zu", bind_i + 1, all_bindings.size());
+                selector_log_rss(label);
+            }
         }
 
         std::sort(sens.begin(), sens.end(), [](const auto & a, const auto & b) {
@@ -10307,6 +10434,7 @@ static bool selector_choose_policy(
         });
 
         const int candidate_scan_n = std::min<int>(candidate_encoder_refine_top, (int) sens.size());
+        selector_log_rss("sens-loop-end");
         const int sensitivity_preview_n = std::min<int>(
             candidate_report_top > 0 ? candidate_report_top : candidate_scan_n,
             (int) sens.size());
@@ -10355,6 +10483,7 @@ static bool selector_choose_policy(
         };
         update_candidate_scan_eta(0, true);
         for (int i = 0; i < candidate_scan_n; ++i) {
+            selector_log_rss(("scan-tensor-" + std::to_string(i) + "-start").c_str());
             auto & s = sens[(size_t) i];
             auto & b = all_bindings[s.binding_index];
             const selector_policy * tensor_base_policy = tensor_plan_policy_for_binding(b);
@@ -10442,7 +10571,9 @@ static bool selector_choose_policy(
                 }
             }
             update_candidate_scan_eta(i + 1, i + 1 == candidate_scan_n);
+            selector_log_rss(("scan-tensor-" + std::to_string(i) + "-end").c_str());
         }
+        selector_log_rss("scan-done");
 
         for (auto & s : sens) {
             if (!s.type_candidates.empty()) {

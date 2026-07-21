@@ -36,3 +36,14 @@ section collects changes not yet part of a tagged release.
   roughly `PATCH_WINDOW` (default 16, tunable via `SELECTOR_PATCH_WINDOW`) times the
   largest single candidate tensor, instead of the whole policy at once. Behavior and
   restore-on-failure semantics are unchanged.
+
+- **selector (stage-b): optional GGUF-based MXFP6 restore.** When VRAM is nearly full
+  after the model is loaded, the MXFP6 device snapshot allocation can fail and the
+  old code fell back to a per-tensor host copy (`original_target_bytes`), which for
+  hundreds of MXFP6 tensors summed to tens of GiB of host anonymous memory. With
+  `SELECTOR_MXFP6_FILE_RESTORE=1` the fallback reads the original tensor data from
+  the GGUF checkpoint file at restore time instead of keeping a persistent host copy,
+  eliminating the large host-RAM overhead. Restore reads are slower (SSD pread per
+  tensor instead of memcpy from RAM), but `restore_all()` only runs between policy
+  evaluations and on failure, not per chunk. Default is `0` (old behavior: host copy).
+  Enable on machines with very limited RAM where the host copy would cause swapping.
