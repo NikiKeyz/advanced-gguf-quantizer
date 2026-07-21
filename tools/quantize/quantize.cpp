@@ -609,6 +609,7 @@ struct selector_binding {
     std::vector<uint8_t> working_scale_bytes;
     std::vector<uint8_t> original_input_scale_bytes;
     std::vector<uint8_t> working_input_scale_bytes;
+    std::vector<uint8_t> original_mxfp6_header;
     selector_device_snapshot original_target_device;
     selector_device_snapshot original_scale_device;
     selector_device_snapshot original_input_scale_device;
@@ -3560,18 +3561,39 @@ static bool quantize_binding_ensure_target_bytes(selector_binding & binding) {
     if (binding.target == nullptr || binding.target_nbytes == 0) {
         return false;
     }
+    const bool is_mxfp6 = binding.target->type == GGML_TYPE_MXFP6_E2M3;
+
+    // Try to capture a GPU-side snapshot of the original tensor. restore_all() uses it
+    // to undo candidate patches, so stage-b avoids a full host-RAM copy of every
+    // tensor's weights. NVFP4 supports this snapshot; MXFP6_E2M3 may not on some setups
+    // (ggml_cuda_tensor_snapshot needs an active device pointer the MXFP6 path does not
+    // expose), in which case we fall back to a host copy below.
     if (!binding.original_target_device.valid_for(binding.target_nbytes)) {
         (void) binding.original_target_device.capture(binding.target, binding.target_nbytes);
     }
-    if (binding.original_target_bytes.size() != binding.target_nbytes) {
-        binding.original_target_bytes.resize(binding.target_nbytes);
-        if (!quantize_tensor_copy_out(binding.target, binding.original_target_bytes.data(), binding.target_nbytes)) {
+    const bool have_device_snapshot = binding.original_target_device.valid_for(binding.target_nbytes);
+
+    // MXFP6_E2M3 embeds a scalar header (e.g. input_scale) we read back when
+    // quantizing a candidate; keep only that small header, not the whole tensor.
+    if (is_mxfp6 && binding.original_mxfp6_header.size() != MXFP6_HEADER_OFFSET) {
+        binding.original_mxfp6_header.resize(MXFP6_HEADER_OFFSET);
+        if (!quantize_tensor_copy_out(binding.target, binding.original_mxfp6_header.data(), MXFP6_HEADER_OFFSET)) {
             return false;
         }
     }
-    if (binding.working_target_bytes.size() != binding.target_nbytes) {
-        binding.working_target_bytes.resize(binding.target_nbytes);
+
+    // When no usable GPU snapshot exists (e.g. MXFP6_E2M3 here), keep a host copy of the
+    // full original tensor so restore_all() can still undo candidate patches. This bounds
+    // host RAM to only the tensor types that need it, instead of the whole checkpoint.
+    if (!have_device_snapshot) {
+        if (binding.original_target_bytes.size() != binding.target_nbytes) {
+            binding.original_target_bytes.resize(binding.target_nbytes);
+            if (!quantize_tensor_copy_out(binding.target, binding.original_target_bytes.data(), binding.target_nbytes)) {
+                return false;
+            }
+        }
     }
+    // NOTE: working_target_bytes is allocated lazily by the quantization callers.
     return true;
 }
 
@@ -3590,8 +3612,9 @@ static bool quantize_binding_ensure_scale_bytes(selector_binding & binding) {
         }
         if (binding.original_scale_bytes.size() != binding.target_scale_nbytes) {
             binding.original_scale_bytes.resize(binding.target_scale_nbytes);
-            const auto * header = (const tensor_mxfp6 *) binding.original_target_bytes.data();
-            const float weight_scale = header->weight_scale > 0.0f && std::isfinite(header->weight_scale) ? header->weight_scale : 1.0f;
+            const auto * header = (const tensor_mxfp6 *) binding.original_mxfp6_header.data();
+            const float weight_scale = header != nullptr && header->weight_scale > 0.0f && std::isfinite(header->weight_scale)
+                ? header->weight_scale : 1.0f;
             memcpy(binding.original_scale_bytes.data(), &weight_scale, sizeof(float));
         }
         if (binding.working_scale_bytes.size() != binding.target_scale_nbytes) {
@@ -3728,24 +3751,6 @@ static bool quantize_restore_from_snapshot_or_host(
         ++counters->failed;
     }
     return false;
-}
-
-static bool quantize_restore_from_host(
-        ggml_tensor * tensor,
-        const std::vector<uint8_t> & host_bytes,
-        size_t nbytes,
-        selector_restore_counters * counters) {
-    if (tensor == nullptr || nbytes == 0 || host_bytes.size() != nbytes ||
-            !quantize_tensor_copy_in(tensor, host_bytes.data(), nbytes)) {
-        if (counters != nullptr) {
-            ++counters->failed;
-        }
-        return false;
-    }
-    if (counters != nullptr) {
-        ++counters->host;
-    }
-    return true;
 }
 
 static std::vector<std::string> selector_build_stress_tensors(
@@ -5117,8 +5122,8 @@ static bool mxfp6_selector_quantize_binding(
         base_scales = (const float *) binding.original_scale_bytes.data();
         tuned_scales = (float *) out_scale_bytes.data();
         input_scale = 1.0f;
-        if (binding.original_target_bytes.size() >= MXFP6_HEADER_OFFSET) {
-            const auto * header = (const tensor_mxfp6 *) binding.original_target_bytes.data();
+        if (binding.original_mxfp6_header.size() >= MXFP6_HEADER_OFFSET) {
+            const auto * header = (const tensor_mxfp6 *) binding.original_mxfp6_header.data();
             input_scale = header->input_scale > 0.0f && std::isfinite(header->input_scale) ? header->input_scale : 1.0f;
         }
         return true;
@@ -6559,10 +6564,9 @@ static bool selector_choose_policy(
             return;
         }
         for (auto & b : all_bindings) {
-            if (!quantize_tensor_host_buffer(b.target) &&
-                    b.original_target_bytes.size() == b.target_nbytes) {
-                quantize_restore_from_host(
-                    b.target, b.original_target_bytes, b.target_nbytes, &runtime_restore_counters);
+            if (!quantize_tensor_host_buffer(b.target)) {
+                quantize_restore_from_snapshot_or_host(
+                    b.target, b.original_target_device, b.original_target_bytes, b.target_nbytes, &runtime_restore_counters);
             }
             if (b.target_scale != nullptr && !quantize_tensor_host_buffer(b.target_scale) &&
                     b.original_scale_bytes.size() == b.target_scale_nbytes) {
@@ -6886,6 +6890,9 @@ static bool selector_choose_policy(
                 fprintf(stderr, "%s: selector failed writing policy bytes for %s\n", __func__, b.name.c_str());
                 return false;
             }
+            // Release the host staging buffer now that the candidate lives on the device.
+            b.working_target_bytes.clear();
+            b.working_target_bytes.shrink_to_fit();
             sum_sq += bs.tensor_sq;
             sum_abs += bs.tensor_abs;
             max_abs = std::max(max_abs, bs.tensor_max);
@@ -7098,6 +7105,9 @@ static bool selector_choose_policy(
                 fprintf(stderr, "%s: selector failed writing policy bytes for %s\n", __func__, b.name.c_str());
                 return false;
             }
+            // Release the host staging buffer now that the candidate lives on the device.
+            b.working_target_bytes.clear();
+            b.working_target_bytes.shrink_to_fit();
             sum_sq += bs.tensor_sq;
             sum_abs += bs.tensor_abs;
             max_abs = std::max(max_abs, bs.tensor_max);
@@ -8803,6 +8813,9 @@ static bool selector_choose_policy(
                     restore_all();
                     return false;
                 }
+                // Release the host staging buffer now that the candidate lives on the device.
+                b.working_target_bytes.clear();
+                b.working_target_bytes.shrink_to_fit();
             }
             if (policy_patch_ok && direct_patch_count > 0 && stageb_verify_direct_patch) {
                 bool direct_verified = false;
@@ -8867,6 +8880,9 @@ static bool selector_choose_policy(
                                 restore_all();
                                 return false;
                             }
+                            // Release the host staging buffer now that the candidate lives on the device.
+                            b.working_target_bytes.clear();
+                            b.working_target_bytes.shrink_to_fit();
                             ++direct_fallback_count;
                         }
                     }
@@ -10874,6 +10890,9 @@ static bool selector_choose_policy(
             if (!quantize_tensor_copy_in(b.target, b.working_target_bytes.data(), b.target_nbytes)) {
                 return false;
             }
+            // Release the host staging buffer now that the candidate lives on the device.
+            b.working_target_bytes.clear();
+            b.working_target_bytes.shrink_to_fit();
             if (!copy_mxfp6_scale_tensor(b)) {
                 return false;
             }
