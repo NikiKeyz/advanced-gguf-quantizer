@@ -92,14 +92,8 @@ Runtime and memory:
 Selector runtime context sizing (advanced-gguf-quantizer only):
 
 - `selector.n_seq`: optional parallel KLD evaluation sequence count. Leave blank
-  for the auto value. The auto value is tuned for throughput, but on multi-GPU
-  it is additionally capped by the tightest per-device VRAM budget (model split
-  plus the n_seq-scaled graph compute buffer and recurrent-state buffer). After
-  the context is created the loader checks that every device keeps at least the
-  eval reserve (~2 GiB) free for tensor-eval scratch; if not, `n_seq` is shrunk
-  further (and the run falls back to proxy-only selection only if even `n_seq=1`
-  cannot keep the reserve, i.e. the `tensor_split` is unbalanced). Set this only
-  to force a specific value.
+  for the auto value. The auto value is tuned for throughput. Set this only to
+  force a specific value.
 - `selector.eval_batch`: optional override for the selector calibration
   micro-batch (`n_batch`/`n_ubatch`). Leave blank to use the auto value
   (`n_ctx`). A smaller value bounds the activation buffer on small GPUs.
@@ -113,21 +107,8 @@ Selector runtime context sizing (advanced-gguf-quantizer only):
   proportionally to these weights, instead of the default free-memory split
   which can produce uneven VRAM distribution (one GPU holding the lm_head
   logits buffer becoming much heavier). Leave blank for the default
-  free-memory split. Whichever device gets the larger weight share must also
-  hold the recurrent-state buffer and its share of the compute buffer; if the
-  split leaves any device below the eval reserve after load, the loader shrinks
-  `n_seq` and, when even `n_seq=1` is insufficient, warns that the split is
-  unbalanced and falls back to proxy-only selection. Favour a split that leaves
-  roughly equal free VRAM on every device.
-- `selector.tensor_split_auto`: when `true`, the selector measures the per-device
-  VRAM footprint of a probe load and picks a `tensor_split` that leaves roughly
-  equal free VRAM on every device (the lm_head logits buffer lives on the CUDA
-  host and the recurrent-state / compute buffers are not split evenly by
-  llama.cpp's free-memory split, so a naive split can starve one device). This
-  overrides an explicit `selector.tensor_split` and re-balances per checkpoint,
-  so it survives checkpoint size changes. Off by default; enable it for large
-  models (e.g. 27B) instead of hand-tuning `tensor_split`. It adds one probe
-  model load per checkpoint.
+  free-memory split. Favour a split that leaves roughly equal free VRAM on every
+  device.
 - `selector.eval_rows`: optional cap on the number of rows evaluated per tensor
   during selector runtime KLD evaluation. By default every tensor is evaluated
   over all its rows; for a 27B output layer (`blk.64`, 5120 rows) this allocates

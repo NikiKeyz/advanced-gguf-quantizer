@@ -186,7 +186,6 @@ struct Recipe {
         std::string eval_batch;
         std::string n_gpu_layers;
         std::string tensor_split;
-        bool tensor_split_auto = false;
         std::string eval_rows;
         std::string verbosity;
         std::string sensitivity_report;
