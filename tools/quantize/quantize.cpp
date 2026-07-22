@@ -10240,8 +10240,9 @@ static bool selector_choose_policy(
 		            fprintf(stderr,
 		                "%s: selector materialization could not replay exact scales; final writer will recompute tensor scales once\n",
 		                __func__);
-		        }
-		    }
+            }
+        }
+
 	    if (out_tensor_overrides) {
 	        out_tensor_overrides->clear();
 	        if (out_name == "seed_keep" && !tensor_policy_map.empty()) {
@@ -10925,6 +10926,16 @@ static bool selector_choose_policy(
                 s.proxy_score = proxy_metrics.score;
                 mx6_sens.push_back(s);
             }
+        }
+        // Release the per-binding working buffers allocated by the MXFP6 sensitivity
+        // scoring above. They are only needed for proxy-score computation and would
+        // otherwise sum to tens of GiB of host anonymous memory for hundreds of MXFP6
+        // tensors. The scale-refine phase re-allocates them on demand.
+        for (auto & b : mxfp6_bindings) {
+            b.working_target_bytes.clear();
+            b.working_target_bytes.shrink_to_fit();
+            b.working_scale_bytes.clear();
+            b.working_scale_bytes.shrink_to_fit();
         }
         std::sort(mx6_sens.begin(), mx6_sens.end(), [](const auto & a, const auto & b) {
             if (a.proxy_score != b.proxy_score) return a.proxy_score > b.proxy_score;
