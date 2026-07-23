@@ -986,8 +986,8 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string(out, "checkpoint_model", r.selector.checkpoint_model);
     dump_string(out, "cache_dir", r.selector.cache_dir);
     dump_string(out, "skip_file", r.selector.skip_file);
-    dump_string(out, "ledger", r.selector.ledger);
     if (show_low_level) {
+        dump_string(out, "ledger", r.selector.ledger);
         dump_string(out, "search", r.selector.search);
         dump_string(out, "local_top_k", r.selector.local_top_k);
         dump_string(out, "group_units", r.selector.group_units);
