@@ -203,7 +203,6 @@ if (ADVANCED_GGUF_QUANTIZER_STANDALONE)
     set(GGML_OPENVINO          OFF CACHE BOOL "ggml: use OpenVINO" FORCE)
     set(GGML_CANN              OFF CACHE BOOL "ggml: use CANN" FORCE)
     set(GGML_HEXAGON           OFF CACHE BOOL "ggml: enable Hexagon backend" FORCE)
-    set(GGML_ZENDNN            OFF CACHE BOOL "ggml: use ZenDNN" FORCE)
 endif()
 
 include("cmake/license.cmake")
