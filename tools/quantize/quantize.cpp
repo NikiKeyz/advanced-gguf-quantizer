@@ -15,6 +15,10 @@
 #include "../../src/llama-quant.h"
 #include "../../ggml/src/ggml-impl.h"
 #include "../../ggml/src/ggml-quants.h"
+
+#ifdef GGML_USE_CUDA
+#include <cuda_runtime.h>
+#endif
 #include "gguf.h"
 #include "nlohmann/json.hpp"
 
@@ -614,6 +618,7 @@ struct selector_binding {
     std::vector<uint8_t> original_input_scale_bytes;
     std::vector<uint8_t> working_input_scale_bytes;
     std::vector<uint8_t> original_mxfp6_header;
+    int target_device = -1;  // CUDA device for the target tensor (-1 = undetermined)
     selector_device_snapshot original_target_device;
     selector_device_snapshot original_scale_device;
     selector_device_snapshot original_input_scale_device;
@@ -6583,6 +6588,18 @@ static bool selector_choose_policy(
         b.layer = selector_parse_layer(tname);
         b.bucket = selector_layer_bucket(b.layer, n_layer);
         b.target = target_tensor;
+#ifdef GGML_USE_CUDA
+        if (b.target != nullptr && b.target->buffer != nullptr &&
+                !ggml_backend_buffer_is_host(b.target->buffer)) {
+            cudaPointerAttributes attr;
+            if (cudaPointerGetAttributes(&attr, b.target->data) == cudaSuccess) {
+                b.target_device = (int) attr.device;
+                if (b.target_device < 0 || b.target_device >= GGML_CUDA_MAX_DEVICES) {
+                    b.target_device = 0;
+                }
+            }
+        }
+#endif
         if (is_mxfp6_target) {
             const std::string scale_name = llama_nvfp4_scale_tensor_name(tname);
             auto scale_it = seed_ml.weights_map.find(scale_name);
@@ -8857,6 +8874,13 @@ static bool selector_choose_policy(
                 // in parallel, then apply (copy-in + release) it serially before the next.
                 const size_t patch_window = (size_t) std::max<int64_t>(1,
                     selector_control_i64("PATCH_WINDOW", 16));
+#ifdef GGML_USE_CUDA
+                const int mgpu_ndev = std::max(1, ggml_backend_cuda_get_device_count());
+                const bool mgpu_enabled = mgpu_ndev > 1 && eval_binding_indices.size() > 1;
+#else
+                const int mgpu_ndev = 1;
+                const bool mgpu_enabled = false;
+#endif
                 for (size_t wlo = 0; wlo < eval_binding_indices.size(); wlo += patch_window) {
                     const size_t whi = std::min(wlo + patch_window, eval_binding_indices.size());
                     std::atomic<size_t> next_patch { wlo };
@@ -8865,7 +8889,13 @@ static bool selector_choose_policy(
                     std::vector<std::thread> workers;
                     workers.reserve((size_t) stageb_patch_threads);
                     for (int ti = 0; ti < stageb_patch_threads; ++ti) {
-                        workers.emplace_back([&]() {
+                        workers.emplace_back([&, ti]() {
+#ifdef GGML_USE_CUDA
+                            const int my_device = mgpu_enabled ? (ti % mgpu_ndev) : 0;
+                            if (mgpu_enabled) {
+                                cudaSetDevice(my_device);
+                            }
+#endif
                             while (true) {
                                 if (patch_failed.load(std::memory_order_acquire)) {
                                     break;
@@ -8876,6 +8906,12 @@ static bool selector_choose_policy(
                                 }
                                 auto & b = all_bindings[eval_binding_indices[pos]];
                                 auto & r = patch_results[pos];
+#ifdef GGML_USE_CUDA
+                                if (mgpu_enabled && b.target_device >= 0 &&
+                                        b.target_device != my_device) {
+                                    cudaSetDevice(b.target_device);
+                                }
+#endif
                                 patch_update("encoding", pos);
                                 if (stageb_direct_patch &&
                                         nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
@@ -8883,6 +8919,11 @@ static bool selector_choose_policy(
                                             stageb_collect_patch_eval_metrics)) {
                                     r.direct_applied = true;
                                     patch_done_one("encoded direct", pos);
+#ifdef GGML_USE_CUDA
+                                    if (mgpu_enabled) {
+                                        cudaSetDevice(my_device);
+                                    }
+#endif
                                     continue;
                                 }
                                 if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
@@ -8895,6 +8936,11 @@ static bool selector_choose_policy(
                                     return;
                                 }
                                 patch_done_one("encoded", pos);
+#ifdef GGML_USE_CUDA
+                                if (mgpu_enabled) {
+                                    cudaSetDevice(my_device);
+                                }
+#endif
                             }
                         });
                     }
@@ -8911,6 +8957,14 @@ static bool selector_choose_policy(
                         return false;
                     }
                     for (size_t pos = wlo; pos < whi; ++pos) {
+#ifdef GGML_USE_CUDA
+                        if (mgpu_enabled) {
+                            auto & b = all_bindings[eval_binding_indices[pos]];
+                            if (b.target_device >= 0) {
+                                cudaSetDevice(b.target_device);
+                            }
+                        }
+#endif
                         if (!apply_patch(pos)) {
                             return false;
                         }
