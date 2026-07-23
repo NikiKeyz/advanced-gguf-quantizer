@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cmath>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <cinttypes>
 #include <cstdlib>
@@ -24,9 +25,14 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <regex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
+#ifdef GGML_USE_CUDA
+#include <cuda_runtime.h>
+#endif
 
 static bool llama_nvfp4_ascii_iequals(const std::string & a, const char * b) {
     size_t i = 0;
@@ -1481,7 +1487,11 @@ static size_t llama_tensor_quantize_impl(
             256.0f,
         };
         bool nvfp4_cfg_valid = false;
-        void * nvfp4_tune_stream = reinterpret_cast<void *>(2);
+        // Use device-aware stream key for A/B tuning so multi-GPU tensor workers
+        // don't all route to GPU0's cached stream.
+        int nvfp4_tune_device = 0;
+        cudaGetDevice(&nvfp4_tune_device);
+        void * nvfp4_tune_stream = reinterpret_cast<void *>(0x3000 + nvfp4_tune_device);
         const int64_t nb_total = (nrows * n_per_row) / LLAMA_NVFP4_BLOCK_SIZE;
         const int64_t sample_nb = nvfp4_sample_blocks_override > 0
             ? std::min<int64_t>(nb_total, nvfp4_sample_blocks_override)
@@ -1618,49 +1628,139 @@ static size_t llama_tensor_quantize_impl(
         };
 
         if (cuda_threads > 1 && cuda_nchunk > 1) {
-            std::atomic<int64_t> next_row{0};
             std::atomic<bool> chunks_ok{true};
 
-            auto cuda_worker = [&](int worker_idx) {
-                void * stream_key = reinterpret_cast<void *>((uintptr_t) (0x1000 + worker_idx));
-                while (chunks_ok.load(std::memory_order_relaxed)) {
-                    const int64_t first_row = next_row.fetch_add(cuda_chunk_rows, std::memory_order_relaxed);
-                    if (first_row >= nrows) {
-                        break;
+#ifdef GGML_USE_CUDA
+            const int mgpu_ndev = ggml_backend_cuda_get_device_count() > 1
+                ? ggml_backend_cuda_get_device_count() : 1;
+            const bool mgpu_enabled = mgpu_ndev > 1 && nrows >= (int64_t) mgpu_ndev * 128;
+            const size_t src_row_bytes = bf16_data != nullptr
+                ? (size_t) n_per_row * sizeof(ggml_bf16_t)
+                : (size_t) n_per_row * sizeof(float);
+
+            /* Multi-GPU: split rows across GPUs upfront to avoid fetch_add race.
+                Each GPU gets a contiguous row range; workers within a GPU share it. */
+            if (mgpu_enabled) {
+                const int threads_per_dev = std::max(1, cuda_threads / mgpu_ndev);
+                std::vector<std::thread> mgpu_workers;
+                mgpu_workers.reserve((size_t) cuda_threads);
+
+                for (int d = 0; d < mgpu_ndev; ++d) {
+                    const int64_t dev_row_start = (nrows * (int64_t) d) / (int64_t) mgpu_ndev;
+                    const int64_t dev_row_end = (nrows * (int64_t) (d + 1)) / (int64_t) mgpu_ndev;
+                    const int64_t dev_nrows = dev_row_end - dev_row_start;
+
+                    if (dev_nrows <= 0) {
+                        continue;
                     }
 
-                    const int64_t this_nrow = std::min(nrows - first_row, cuda_chunk_rows);
-                    const void * src_chunk = bf16_data != nullptr
-                        ? (const void *) (bf16_data + first_row * n_per_row)
-                        : (const void *) (f32_data + first_row * n_per_row);
-                    void * dst_chunk = (char *) new_data + first_row * row_size;
+                    const int dev_base_worker = d * threads_per_dev;
+                    auto dev_next = std::make_shared<std::atomic<int64_t>>(dev_row_start);
 
-                    if (!quantize_cuda_once(src_chunk, dst_chunk, this_nrow, stream_key)) {
-                        chunks_ok.store(false, std::memory_order_relaxed);
-                        break;
-                    }
+                    auto dev_worker = [&, dev_d = d, dev_next, dev_row_end](int widx) {
+                        cudaSetDevice(dev_d);
+                        void * stream_key = reinterpret_cast<void *>((uintptr_t) (0x1000 + widx));
+                        void * d_x_buf = nullptr;
+                        size_t d_x_cap = 0;
 
-                    const size_t chunk_bytes = (size_t) this_nrow * row_size;
-                    if (!ggml_validate_row_data(new_type, dst_chunk, chunk_bytes)) {
-                        LLAMA_LOG_WARN("%s: mxfp6_e2m3 cuda validation failed tensor=%s first_row=%" PRId64 " rows=%" PRId64 " bytes=%zu\n",
-                                __func__, tensor_name ? tensor_name : "(unknown)", first_row, this_nrow, chunk_bytes);
-                        chunks_ok.store(false, std::memory_order_relaxed);
-                        break;
+                        while (chunks_ok.load(std::memory_order_relaxed)) {
+                            const int64_t first_row = dev_next->fetch_add(cuda_chunk_rows, std::memory_order_relaxed);
+                            if (first_row >= dev_row_end) {
+                                break;
+                            }
+
+                            const int64_t this_nrow = std::min(dev_row_end - first_row, cuda_chunk_rows);
+                            const void * src_chunk = bf16_data != nullptr
+                                ? (const void *) (bf16_data + first_row * n_per_row)
+                                : (const void *) (f32_data + first_row * n_per_row);
+                            void * dst_chunk = (char *) new_data + first_row * row_size;
+
+                            const size_t chunk_src_bytes = (size_t) this_nrow * src_row_bytes;
+                            if (chunk_src_bytes > d_x_cap) {
+                                cudaFree(d_x_buf);
+                                d_x_buf = nullptr;
+                                d_x_cap = 0;
+                                if (cudaMalloc(&d_x_buf, chunk_src_bytes) != cudaSuccess) {
+                                    chunks_ok.store(false, std::memory_order_relaxed);
+                                    break;
+                                }
+                                d_x_cap = chunk_src_bytes;
+                            }
+                            if (cudaMemcpy(d_x_buf, src_chunk, chunk_src_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                                chunks_ok.store(false, std::memory_order_relaxed);
+                                break;
+                            }
+                            if (!quantize_cuda_once(d_x_buf, dst_chunk, this_nrow, stream_key)) {
+                                chunks_ok.store(false, std::memory_order_relaxed);
+                                break;
+                            }
+
+                            const size_t chunk_bytes = (size_t) this_nrow * row_size;
+                            if (!ggml_validate_row_data(new_type, dst_chunk, chunk_bytes)) {
+                                LLAMA_LOG_WARN("%s: cuda validation failed tensor=%s first_row=%" PRId64 " rows=%" PRId64 " bytes=%zu\n",
+                                        __func__, tensor_name ? tensor_name : "(unknown)", first_row, this_nrow, chunk_bytes);
+                                chunks_ok.store(false, std::memory_order_relaxed);
+                                break;
+                            }
+                        }
+                        cudaFree(d_x_buf);
+                    };
+
+                    for (int t = 0; t < threads_per_dev; ++t) {
+                        mgpu_workers.emplace_back(dev_worker, dev_base_worker + t);
                     }
                 }
-            };
 
-            workers.clear();
-            workers.reserve((size_t) cuda_threads - 1);
-            for (int t = 1; t < cuda_threads; ++t) {
-                workers.emplace_back(cuda_worker, t);
+                for (auto & w : mgpu_workers) {
+                    w.join();
+                }
+                cuda_ok = chunks_ok.load(std::memory_order_relaxed);
+            } else
+#endif
+            {
+                std::atomic<int64_t> next_row{0};
+
+                auto cuda_worker = [&](int worker_idx) {
+                    void * stream_key = reinterpret_cast<void *>((uintptr_t) (0x1000 + worker_idx));
+                    while (chunks_ok.load(std::memory_order_relaxed)) {
+                        const int64_t first_row = next_row.fetch_add(cuda_chunk_rows, std::memory_order_relaxed);
+                        if (first_row >= nrows) {
+                            break;
+                        }
+
+                        const int64_t this_nrow = std::min(nrows - first_row, cuda_chunk_rows);
+                        const void * src_chunk = bf16_data != nullptr
+                            ? (const void *) (bf16_data + first_row * n_per_row)
+                            : (const void *) (f32_data + first_row * n_per_row);
+                        void * dst_chunk = (char *) new_data + first_row * row_size;
+
+                        if (!quantize_cuda_once(src_chunk, dst_chunk, this_nrow, stream_key)) {
+                            chunks_ok.store(false, std::memory_order_relaxed);
+                            break;
+                        }
+
+                        const size_t chunk_bytes = (size_t) this_nrow * row_size;
+                        if (!ggml_validate_row_data(new_type, dst_chunk, chunk_bytes)) {
+                            LLAMA_LOG_WARN("%s: mxfp6_e2m3 cuda validation failed tensor=%s first_row=%" PRId64 " rows=%" PRId64 " bytes=%zu\n",
+                                    __func__, tensor_name ? tensor_name : "(unknown)", first_row, this_nrow, chunk_bytes);
+                            chunks_ok.store(false, std::memory_order_relaxed);
+                            break;
+                        }
+                    }
+                };
+
+                workers.clear();
+                workers.reserve((size_t) cuda_threads - 1);
+                for (int t = 1; t < cuda_threads; ++t) {
+                    workers.emplace_back(cuda_worker, t);
+                }
+                cuda_worker(0);
+                for (auto & w : workers) {
+                    w.join();
+                }
+                workers.clear();
+                cuda_ok = chunks_ok.load(std::memory_order_relaxed);
             }
-            cuda_worker(0);
-            for (auto & w : workers) {
-                w.join();
-            }
-            workers.clear();
-            cuda_ok = chunks_ok.load(std::memory_order_relaxed);
         } else {
             cuda_ok = quantize_cuda_once(src, new_data, nrows, reinterpret_cast<void *>(2));
         }
@@ -1722,47 +1822,111 @@ static size_t llama_tensor_quantize_impl(
         };
 
         if (cuda_threads > 1 && cuda_nchunk > 1) {
-            std::atomic<int64_t> next_row{0};
             std::atomic<bool> chunks_ok{true};
 
-            auto cuda_worker = [&](int worker_idx) {
-                void * stream_key = reinterpret_cast<void *>((uintptr_t) (0x2000 + worker_idx));
-                while (chunks_ok.load(std::memory_order_relaxed)) {
-                    const int64_t first_row = next_row.fetch_add(cuda_chunk_rows, std::memory_order_relaxed);
-                    if (first_row >= nrows) {
-                        break;
+#ifdef GGML_USE_CUDA
+            const int mgpu_ndev = ggml_backend_cuda_get_device_count() > 1
+                ? ggml_backend_cuda_get_device_count() : 1;
+            const bool mgpu_enabled = mgpu_ndev > 1 && nrows >= (int64_t) mgpu_ndev * 128;
+            if (mgpu_enabled) {
+                const int threads_per_dev = std::max(1, cuda_threads / mgpu_ndev);
+                std::vector<std::thread> mgpu_workers;
+                mgpu_workers.reserve((size_t) cuda_threads);
+
+                for (int d = 0; d < mgpu_ndev; ++d) {
+                    const int64_t dev_row_start = (nrows * (int64_t) d) / (int64_t) mgpu_ndev;
+                    const int64_t dev_row_end = (nrows * (int64_t) (d + 1)) / (int64_t) mgpu_ndev;
+                    const int64_t dev_nrows = dev_row_end - dev_row_start;
+
+                    if (dev_nrows <= 0) {
+                        continue;
                     }
 
-                    const int64_t this_nrow = std::min(nrows - first_row, cuda_chunk_rows);
-                    const void * src_chunk = bf16_data != nullptr
-                        ? (const void *) (bf16_data + first_row * n_per_row)
-                        : (const void *) (f32_data + first_row * n_per_row);
-                    void * dst_chunk = (char *) new_data + first_row * row_size;
+                    const int dev_base_worker = d * threads_per_dev;
+                    auto dev_next = std::make_shared<std::atomic<int64_t>>(dev_row_start);
 
-                    if (!quantize_cuda_once(src_chunk, dst_chunk, this_nrow, stream_key)) {
-                        chunks_ok.store(false, std::memory_order_relaxed);
-                        break;
-                    }
+                    auto dev_worker = [&, dev_d = d, dev_next, dev_row_end](int widx) {
+                        cudaSetDevice(dev_d);
+                        void * stream_key = reinterpret_cast<void *>((uintptr_t) (0x2000 + widx));
 
-                    const size_t chunk_bytes = (size_t) this_nrow * row_size;
-                    if (new_type != GGML_TYPE_MXFP6_E2M3 && !ggml_validate_row_data(new_type, dst_chunk, chunk_bytes)) {
-                        chunks_ok.store(false, std::memory_order_relaxed);
-                        break;
+                        while (chunks_ok.load(std::memory_order_relaxed)) {
+                            const int64_t first_row = dev_next->fetch_add(cuda_chunk_rows, std::memory_order_relaxed);
+                            if (first_row >= dev_row_end) {
+                                break;
+                            }
+
+                            const int64_t this_nrow = std::min(dev_row_end - first_row, cuda_chunk_rows);
+                            const void * src_chunk = bf16_data != nullptr
+                                ? (const void *) (bf16_data + first_row * n_per_row)
+                                : (const void *) (f32_data + first_row * n_per_row);
+                            void * dst_chunk = (char *) new_data + first_row * row_size;
+
+                            if (!quantize_cuda_once(src_chunk, dst_chunk, this_nrow, stream_key)) {
+                                chunks_ok.store(false, std::memory_order_relaxed);
+                                break;
+                            }
+
+                            const size_t chunk_bytes = (size_t) this_nrow * row_size;
+                            if (new_type != GGML_TYPE_MXFP6_E2M3 && !ggml_validate_row_data(new_type, dst_chunk, chunk_bytes)) {
+                                chunks_ok.store(false, std::memory_order_relaxed);
+                                break;
+                            }
+                        }
+                    };
+
+                    for (int t = 0; t < threads_per_dev; ++t) {
+                        mgpu_workers.emplace_back(dev_worker, dev_base_worker + t);
                     }
                 }
-            };
 
-            workers.clear();
-            workers.reserve((size_t) cuda_threads - 1);
-            for (int t = 1; t < cuda_threads; ++t) {
-                workers.emplace_back(cuda_worker, t);
+                for (auto & w : mgpu_workers) {
+                    w.join();
+                }
+                cuda_ok = chunks_ok.load(std::memory_order_relaxed);
+            } else
+#endif
+            {
+                std::atomic<int64_t> next_row{0};
+
+                auto cuda_worker = [&](int worker_idx) {
+                    void * stream_key = reinterpret_cast<void *>((uintptr_t) (0x2000 + worker_idx));
+                    while (chunks_ok.load(std::memory_order_relaxed)) {
+                        const int64_t first_row = next_row.fetch_add(cuda_chunk_rows, std::memory_order_relaxed);
+                        if (first_row >= nrows) {
+                            break;
+                        }
+
+                        const int64_t this_nrow = std::min(nrows - first_row, cuda_chunk_rows);
+                        const void * src_chunk = bf16_data != nullptr
+                            ? (const void *) (bf16_data + first_row * n_per_row)
+                            : (const void *) (f32_data + first_row * n_per_row);
+                        void * dst_chunk = (char *) new_data + first_row * row_size;
+
+                        if (!quantize_cuda_once(src_chunk, dst_chunk, this_nrow, stream_key)) {
+                            chunks_ok.store(false, std::memory_order_relaxed);
+                            break;
+                        }
+
+                        const size_t chunk_bytes = (size_t) this_nrow * row_size;
+                        if (new_type != GGML_TYPE_MXFP6_E2M3 && !ggml_validate_row_data(new_type, dst_chunk, chunk_bytes)) {
+                            chunks_ok.store(false, std::memory_order_relaxed);
+                            break;
+                        }
+                    }
+                };
+
+                workers.clear();
+                workers.reserve((size_t) cuda_threads - 1);
+                for (int t = 1; t < cuda_threads; ++t) {
+                    workers.emplace_back(cuda_worker, t);
+                }
+                cuda_worker(0);
+                for (auto & w : workers) {
+                    w.join();
+                }
+                workers.clear();
+                cuda_ok = chunks_ok.load(std::memory_order_relaxed);
             }
-            cuda_worker(0);
-            for (auto & w : workers) {
-                w.join();
-            }
-            workers.clear();
-            cuda_ok = chunks_ok.load(std::memory_order_relaxed);
         } else {
             cuda_ok = quantize_cuda_once(src, new_data, nrows, reinterpret_cast<void *>(3));
         }
@@ -4050,6 +4214,403 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // main loop: iterate over all weights
     //
 
+#ifdef GGML_USE_CUDA
+    // Multi-GPU tensor-level parallelism: GPU workers process full tensors
+    // from a work queue, each on its own device. This parallelizes the
+    // expensive A/B tuning phase across GPUs.
+    struct mgpu_tensor_result {
+        void * data = nullptr;
+        size_t size = 0;
+        std::exception_ptr error;
+    };
+
+    std::vector<std::thread> mgpu_workers;
+    std::vector<mgpu_tensor_result> mgpu_results;
+    std::vector<std::queue<size_t>> mgpu_per_dev_queue;  // per-GPU queues
+    std::mutex mgpu_queue_mutex;
+    std::condition_variable mgpu_queue_cv;
+    std::atomic<bool> mgpu_done{false};
+    bool mgpu_tensor_mode = false;
+    int mgpu_ndev = 0;
+
+    if (!params->dry_run && !resume.active) {
+        mgpu_ndev = ggml_backend_cuda_get_device_count();
+        if (mgpu_ndev > 1) {
+            // Count CUDA tensors (NVFP4/MXFP6 that need quantization)
+            size_t n_cuda_tensors = 0;
+            for (size_t i = 0; i < tensors.size(); ++i) {
+                const auto & tm = metadata[i];
+                const ggml_type new_type = tm.target_type;
+                const ggml_type cur_type = tensors[i]->tensor->type;
+                if ((new_type == GGML_TYPE_NVFP4 || new_type == GGML_TYPE_MXFP6_E2M3) &&
+                        cur_type != new_type && !tm.copy_from_patch) {
+                    ++n_cuda_tensors;
+                }
+            }
+            // Enable multi-GPU tensor mode if beneficial
+            if (n_cuda_tensors >= (size_t) mgpu_ndev * 2) {
+                mgpu_tensor_mode = true;
+                mgpu_results.resize(tensors.size());
+                LLAMA_LOG_INFO("%s: multi-GPU tensor mode enabled (%d GPUs, %zu CUDA tensors)\n",
+                        __func__, mgpu_ndev, n_cuda_tensors);
+            }
+        }
+    }
+
+    if (mgpu_tensor_mode) {
+        // Collect CUDA tensor indices
+        std::vector<size_t> mgpu_cuda_tensor_indices;
+        mgpu_cuda_tensor_indices.reserve(tensors.size());
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            const auto & tm = metadata[i];
+            const ggml_type new_type = tm.target_type;
+            const ggml_type cur_type = tensors[i]->tensor->type;
+            if ((new_type == GGML_TYPE_NVFP4 || new_type == GGML_TYPE_MXFP6_E2M3) &&
+                    cur_type != new_type && !tm.copy_from_patch) {
+                mgpu_cuda_tensor_indices.push_back(i);
+            }
+        }
+
+        // Round-robin assign CUDA tensors to GPU devices for balanced load
+        // Tensor k -> GPU (k % ndev), then GPU d gets tensors d, d+ndev, d+2*ndev, ...
+        // This ensures each GPU gets ~equal number of large tensors
+        mgpu_per_dev_queue.resize((size_t) mgpu_ndev);
+        for (int d = 0; d < mgpu_ndev; ++d) {
+            for (size_t k = (size_t)d; k < mgpu_cuda_tensor_indices.size(); k += (size_t)mgpu_ndev) {
+                mgpu_per_dev_queue[(size_t)d].push(mgpu_cuda_tensor_indices[k]);
+            }
+        }
+
+        // Start GPU workers
+        for (int d = 0; d < mgpu_ndev; ++d) {
+            mgpu_workers.emplace_back([&, d]() {
+                while (true) {
+                    size_t ti;
+                    {
+                        std::unique_lock<std::mutex> lock(mgpu_queue_mutex);
+                        mgpu_queue_cv.wait(lock, [&] {
+                            return !mgpu_per_dev_queue[(size_t)d].empty() || mgpu_done.load(std::memory_order_relaxed);
+                        });
+                        if (mgpu_done.load(std::memory_order_relaxed) && mgpu_per_dev_queue[(size_t)d].empty()) {
+                            break;
+                        }
+                        if (mgpu_per_dev_queue[(size_t)d].empty()) {
+                            continue;
+                        }
+                        ti = mgpu_per_dev_queue[(size_t)d].front();
+                        mgpu_per_dev_queue[(size_t)d].pop();
+                    }
+
+                    cudaSetDevice(d);
+                    try {
+                        const auto & weight = *tensors[ti];
+                        const auto & tm = metadata[ti];
+                        ggml_tensor * tensor = weight.tensor;
+                        const std::string & name = tm.name;
+                        const ggml_type new_type = tm.target_type;
+
+                        // Load tensor data
+                        ml.load_data_for(tensor);
+
+                        // Get imatrix
+                        const float * imatrix = nullptr;
+                        if (imatrix_data) {
+                            auto it = imatrix_data->find(tm.remapped_imatrix_name);
+                            if (it != imatrix_data->end()) {
+                                if (it->second.size() == (size_t)tensor->ne[0]*tensor->ne[2]) {
+                                    imatrix = it->second.data();
+                                }
+                            }
+                        }
+                        if (!imatrix && tm.requires_imatrix) {
+                            throw std::runtime_error(format("Missing importance matrix for tensor %s in a very low-bit quantization", tensor->name));
+                        }
+
+                        // Convert data to F32/BF16
+                        const int64_t nelements = ggml_nelements(tensor);
+                        float * f32_data = nullptr;
+                        const ggml_bf16_t * bf16_data = nullptr;
+
+                        if (tensor->type == GGML_TYPE_F32) {
+                            f32_data = (float *) tensor->data;
+                        } else if (tensor->type == GGML_TYPE_BF16 &&
+                                (new_type == GGML_TYPE_NVFP4 || new_type == GGML_TYPE_MXFP6_E2M3)) {
+                            bf16_data = (const ggml_bf16_t *) tensor->data;
+                        } else if (ggml_is_quantized(tensor->type) && !params->allow_requantize) {
+                            throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
+                        } else {
+                            // Need per-worker f32_conv_buf
+                            static thread_local std::vector<no_init<float>> tl_f32_conv_buf;
+                            if (tl_f32_conv_buf.size() < (size_t)nelements) {
+                                tl_f32_conv_buf.resize(nelements);
+                            }
+                            // Need per-worker workers vector for dequantize
+                            static thread_local std::vector<std::thread> tl_workers;
+                            llama_tensor_dequantize_impl(tensor, tl_f32_conv_buf, tl_workers, nelements, nthread);
+                            f32_data = (float *) tl_f32_conv_buf.data();
+                        }
+
+                        // Initialize NVFP4 aux scales
+                        auto nvfp4_aux_it = nvfp4_aux_tensors.find(name);
+                        nvfp4_aux_tensor_info * nvfp4_aux_info = nvfp4_aux_it != nvfp4_aux_tensors.end() ? &nvfp4_aux_it->second : nullptr;
+                        if (nvfp4_aux_info != nullptr) {
+                            std::fill(nvfp4_aux_info->scale_values.begin(), nvfp4_aux_info->scale_values.end(), 1.0f);
+                            std::fill(nvfp4_aux_info->input_scale_values.begin(), nvfp4_aux_info->input_scale_values.end(), 0.0f);
+                        }
+
+                        // Allocate output buffer
+                        static thread_local std::vector<no_init<uint8_t>> tl_work;
+                        if (tl_work.size() < (size_t)nelements * 4) {
+                            tl_work.resize(nelements * 4);
+                        }
+                        void * new_data = tl_work.data();
+
+                        const int64_t n_per_row = tensor->ne[0];
+                        const int64_t nrows = tensor->ne[1];
+                        const bool is_mxfp6 = new_type == GGML_TYPE_MXFP6_E2M3;
+                        const size_t row_size = ggml_row_size(new_type, n_per_row);
+                        const int64_t n_slices = std::max<int64_t>(1, tensor->ne[2]);
+                        const int64_t mxfp6_padded_nrows = is_mxfp6 ? GGML_PAD(nrows, MXFP6_TILE_ROWS) : nrows;
+                        const size_t mxfp6_payload_offset = is_mxfp6 ? MXFP6_HEADER_OFFSET : 0;
+                        const size_t slice_storage_size = row_size * (size_t) (is_mxfp6 ? mxfp6_padded_nrows : nrows);
+                        std::vector<float> mxfp6_scale_values;
+                        std::vector<float> mxfp6_input_scale_values;
+                        bool mxfp6_shared_tensor_scale = false;
+                        if (is_mxfp6) {
+                            mxfp6_scale_values.assign((size_t) n_slices, 1.0f);
+                            mxfp6_input_scale_values.assign((size_t) n_slices, 1.0f);
+                            mxfp6_shared_tensor_scale = n_slices > 1 || tensor->ne[3] > 1;
+                            if (mxfp6_shared_tensor_scale) {
+                                float tensor_scale = llama_mxfp6_tensor_scale(
+                                        params, f32_data, bf16_data, nrows * n_slices * std::max<int64_t>(1, tensor->ne[3]),
+                                        n_per_row, nullptr, params->mxfp6_tensor_scale, nthread);
+                                if (tm.has_mxfp6_scale_mul) {
+                                    tensor_scale *= tm.mxfp6_e2m3_scale_mul;
+                                }
+                                if (!(tensor_scale > 0.0f) || !std::isfinite(tensor_scale)) {
+                                    tensor_scale = 1.0f;
+                                }
+                                std::fill(mxfp6_scale_values.begin(), mxfp6_scale_values.end(), tensor_scale);
+                            }
+                            const size_t projected = mxfp6_payload_offset + slice_storage_size * (size_t) n_slices;
+                            if (tl_work.size() < projected) {
+                                tl_work.resize(projected);
+                            }
+                            std::memset(new_data, 0, projected);
+                        }
+
+                        static const int64_t min_chunk_size = 32 * 512;
+                        const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
+                        const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
+                        const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
+                        const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
+
+                        // Quantize slices
+                        static thread_local std::vector<std::thread> tl_slice_workers;
+                        size_t new_size = 0;
+
+                        auto quantize_slice_mgpu = [&](int64_t i03, int slice_nthread) -> size_t {
+                            const float * f32_data_03 = f32_data ? (f32_data + i03 * nelements_matrix) : nullptr;
+                            const ggml_bf16_t * bf16_data_03 = bf16_data ? (bf16_data + i03 * nelements_matrix) : nullptr;
+                            void * new_data_03 = (char *) new_data + mxfp6_payload_offset + slice_storage_size * (size_t) i03;
+                            const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
+                            float nvfp4_base_tensor_scale_03 = 1.0f;
+                            float nvfp4_tune_tensor_scale_03 = 0.0f;
+                            bool nvfp4_fixed_tensor_scale_03 = false;
+
+                            if (new_type == GGML_TYPE_NVFP4 && nvfp4_aux_info != nullptr) {
+                                const float tensor_scale = llama_nvfp4_correction_scale(
+                                        f32_data_03, bf16_data_03, nelements_matrix, slice_nthread, nvfp4_correction_denom);
+                                nvfp4_base_tensor_scale_03 = tensor_scale;
+                                nvfp4_aux_info->scale_values[(size_t) i03] = tensor_scale;
+                                if (tm.has_nvfp4_scale_overrides &&
+                                        (size_t) i03 < tm.nvfp4_scale_overrides.size() &&
+                                        (size_t) i03 < tm.nvfp4_base_scale_overrides.size() &&
+                                        std::isfinite(tm.nvfp4_scale_overrides[(size_t) i03]) &&
+                                        tm.nvfp4_scale_overrides[(size_t) i03] > 0.0f &&
+                                        std::isfinite(tm.nvfp4_base_scale_overrides[(size_t) i03]) &&
+                                        tm.nvfp4_base_scale_overrides[(size_t) i03] > 0.0f) {
+                                    nvfp4_base_tensor_scale_03 = tm.nvfp4_base_scale_overrides[(size_t) i03];
+                                    nvfp4_aux_info->scale_values[(size_t) i03] = tm.nvfp4_scale_overrides[(size_t) i03];
+                                    nvfp4_tune_tensor_scale_03 = nvfp4_base_tensor_scale_03;
+                                    nvfp4_fixed_tensor_scale_03 = true;
+                                }
+                                const float input_scale = llama_nvfp4_input_scale_from_imatrix(
+                                        imatrix_03, tensor->ne[0], nvfp4_input_scale_policy);
+                                nvfp4_aux_info->input_scale_values[(size_t) i03] = input_scale;
+                            } else if (is_mxfp6 && !mxfp6_shared_tensor_scale) {
+                                float tensor_scale =
+                                    llama_mxfp6_tensor_scale(params, f32_data_03, bf16_data_03, nrows, n_per_row, imatrix_03, params->mxfp6_tensor_scale, slice_nthread);
+                                if (tm.has_mxfp6_scale_mul) {
+                                    tensor_scale *= tm.mxfp6_e2m3_scale_mul;
+                                }
+                                if (!(tensor_scale > 0.0f) || !std::isfinite(tensor_scale)) {
+                                    tensor_scale = 1.0f;
+                                }
+                                mxfp6_scale_values[(size_t) i03] = tensor_scale;
+                                if (nvfp4_aux_info != nullptr) {
+                                    nvfp4_aux_info->scale_values[(size_t) i03] = tensor_scale;
+                                }
+                                if (imatrix_03 != nullptr) {
+                                    const float input_scale = llama_mxfp6_e2m3_input_scale_from_imatrix(imatrix_03, tensor->ne[0], params);
+                                    GGML_ASSERT(input_scale > 0.0f && std::isfinite(input_scale));
+                                    mxfp6_input_scale_values[(size_t) i03] = input_scale;
+                                    if (nvfp4_aux_info != nullptr && !nvfp4_aux_info->input_scale_values.empty()) {
+                                        nvfp4_aux_info->input_scale_values[(size_t) i03] = input_scale;
+                                    }
+                                }
+                            }
+
+                            const float tensor_scale_03 =
+                                is_mxfp6
+                                ? mxfp6_scale_values[(size_t) i03]
+                                : (nvfp4_aux_info != nullptr)
+                                ? nvfp4_aux_info->scale_values[(size_t) i03]
+                                : 1.0f;
+                            std::vector<std::thread> local_workers;
+                            local_workers.reserve((size_t) std::max(1, slice_nthread));
+                            const tensor_metadata & md = tm;
+                            const nvfp4_cuda_runtime_cfg * nvfp4_cfg_ptr =
+                                md.has_nvfp4_cfg_override ? &md.nvfp4_cfg_override : nullptr;
+                            const int64_t nvfp4_sample_blocks =
+                                md.has_nvfp4_cfg_override ? md.nvfp4_sample_blocks : 0;
+                            float actual_tensor_scale_03 = tensor_scale_03;
+                            const size_t written = llama_tensor_quantize_impl(
+                                    new_type, params, f32_data_03, bf16_data_03, tensor_scale_03,
+                                    new_data_03, chunk_size, nrows, n_per_row, imatrix_03,
+                                    local_workers, slice_nthread, tensor->name,
+                                    nvfp4_cfg_ptr, nvfp4_sample_blocks,
+                                    (new_type == GGML_TYPE_NVFP4 && nvfp4_aux_info != nullptr) ? &actual_tensor_scale_03 : nullptr,
+                                    nvfp4_tune_tensor_scale_03,
+                                    nvfp4_fixed_tensor_scale_03,
+                                    md.has_k_rsf_mode_override ? md.k_rsf_mode_override : 0);
+                            if (new_type == GGML_TYPE_NVFP4 && nvfp4_aux_info != nullptr) {
+                                nvfp4_aux_info->scale_values[(size_t) i03] = actual_tensor_scale_03;
+                            }
+                            if (is_mxfp6) {
+                                if (written > slice_storage_size) {
+                                    throw std::runtime_error(format("MXFP6_E2M3 tensor %s slice %" PRId64 " wrote %zu bytes into %zu-byte slice",
+                                            tensor->name, i03, written, slice_storage_size));
+                                }
+                                if (written < slice_storage_size) {
+                                    std::memset((char *) new_data_03 + written, 0, slice_storage_size - written);
+                                }
+                                return slice_storage_size;
+                            }
+                            return written;
+                        };
+
+                        if ((new_type == GGML_TYPE_NVFP4 || new_type == GGML_TYPE_MXFP6_E2M3) && tensor->ne[2] > 1 && nthread_use > 1) {
+                            const int slice_threads = llama_nvfp4_cuda_parallel_threads((int) nthread_use, tensor->ne[2]);
+                            const int slice_nthread = std::max(1, (int) (nthread_use / slice_threads));
+                            std::vector<size_t> slice_sizes((size_t) tensor->ne[2], 0);
+                            std::atomic<int64_t> next_i03{0};
+                            std::atomic<bool> slices_ok{true};
+                            std::exception_ptr slice_error;
+                            std::mutex slice_error_mutex;
+
+                            auto slice_worker = [&]() {
+                                while (slices_ok.load(std::memory_order_relaxed)) {
+                                    const int64_t i03 = next_i03.fetch_add(1, std::memory_order_relaxed);
+                                    if (i03 >= tensor->ne[2]) {
+                                        break;
+                                    }
+                                    try {
+                                        slice_sizes[(size_t) i03] = quantize_slice_mgpu(i03, slice_nthread);
+                                    } catch (...) {
+                                        slices_ok.store(false, std::memory_order_relaxed);
+                                        std::lock_guard<std::mutex> lock(slice_error_mutex);
+                                        if (!slice_error) {
+                                            slice_error = std::current_exception();
+                                        }
+                                        break;
+                                    }
+                                }
+                            };
+
+                            tl_slice_workers.clear();
+                            tl_slice_workers.reserve((size_t) std::max(0, slice_threads - 1));
+                            for (int t = 1; t < slice_threads; ++t) {
+                                tl_slice_workers.emplace_back(slice_worker);
+                            }
+                            slice_worker();
+                            for (auto & w : tl_slice_workers) {
+                                w.join();
+                            }
+                            tl_slice_workers.clear();
+
+                            if (slice_error) {
+                                std::rethrow_exception(slice_error);
+                            }
+                            if (!slices_ok.load(std::memory_order_relaxed)) {
+                                throw std::runtime_error(format("parallel %s slice quantization failed", ggml_type_name(new_type)));
+                            }
+                            for (size_t sz : slice_sizes) {
+                                new_size += sz;
+                            }
+                        } else {
+                            for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+                                new_size += quantize_slice_mgpu(i03, (int) nthread_use);
+                            }
+                        }
+
+                        if (is_mxfp6) {
+                            auto * header = (tensor_mxfp6 *) new_data;
+                            header->weight_scale  = mxfp6_scale_values.empty() ? 1.0f : mxfp6_scale_values[0];
+                            header->input_scale   = mxfp6_input_scale_values.empty() ? 1.0f : mxfp6_input_scale_values[0];
+                            header->weight_scales = nullptr;
+                            header->input_scales  = nullptr;
+                            new_size += MXFP6_HEADER_OFFSET;
+                            if (!ggml_validate_row_data(new_type, new_data, new_size)) {
+                                throw std::runtime_error("MXFP6_E2M3 tensor/header validation failed");
+                            }
+                        }
+
+                        // Store result - allocate owned buffer
+                        auto * owned_data = malloc(new_size);
+                        std::memcpy(owned_data, new_data, new_size);
+                        {
+                            std::lock_guard<std::mutex> lock(mgpu_queue_mutex);
+                            mgpu_results[ti].data = owned_data;
+                            mgpu_results[ti].size = new_size;
+                        }
+                        mgpu_queue_cv.notify_all();
+                    } catch (...) {
+                        {
+                            std::lock_guard<std::mutex> lock(mgpu_queue_mutex);
+                            mgpu_results[ti].error = std::current_exception();
+                        }
+                        mgpu_queue_cv.notify_all();
+                    }
+                }
+            });
+        }
+    }
+
+#endif
+
+    // RAII-style cleanup: ensures GPU workers are stopped and buffers freed
+    // on both normal exit and exception paths.
+    bool mgpu_finalized = false;
+    auto mgpu_finalize = [&]() {
+        if (mgpu_finalized || !mgpu_tensor_mode) return;
+        mgpu_finalized = true;
+        mgpu_done.store(true, std::memory_order_release);
+        mgpu_queue_cv.notify_all();
+        for (auto & w : mgpu_workers) {
+            if (w.joinable()) w.join();
+        }
+        for (auto & r : mgpu_results) {
+            if (r.data != nullptr) {
+                free(r.data);
+            }
+        }
+        mgpu_results.clear();
+        mgpu_workers.clear();
+    };
+
+    try {
+
     for (size_t i = 0; i < tensors.size(); ++i) {
         const auto & weight = *tensors[i];
         const auto & tm = metadata[i];
@@ -4210,6 +4771,34 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 new_size = tensor_size;
                 LLAMA_LOG_INFO("size = %8.3f MiB\n", tensor_size/1024.0/1024.0);
             } else {
+                // Multi-GPU tensor mode: dispatch CUDA tensors to GPU workers
+#ifdef GGML_USE_CUDA
+                const bool is_cuda_tensor = mgpu_tensor_mode &&
+                        (new_type == GGML_TYPE_NVFP4 || new_type == GGML_TYPE_MXFP6_E2M3) &&
+                        cur_type != new_type && !tm.copy_from_patch;
+
+                if (is_cuda_tensor) {
+                    // Wait for GPU worker to complete this tensor (already pre-enqueued).
+                    // mgpu_queue_mutex guards result completion; producer signals via cv.
+                    {
+                        std::unique_lock<std::mutex> lock(mgpu_queue_mutex);
+                        mgpu_queue_cv.wait(lock, [&]() {
+                            return mgpu_results[i].data != nullptr || mgpu_results[i].error;
+                        });
+                    }
+                    if (mgpu_results[i].error) {
+                        std::rethrow_exception(mgpu_results[i].error);
+                    }
+
+                    // Use GPU worker result
+                    new_data = mgpu_results[i].data;
+                    new_size = mgpu_results[i].size;
+                    LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
+                    fflush(stdout);
+                    LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB (mgpu)\n", tensor_size/1024.0/1024.0, (new_size + auxiliary_size)/1024.0/1024.0);
+                } else
+#endif
+                {
                 const int64_t nelements = ggml_nelements(tensor);
 
                 const float * imatrix = nullptr;
@@ -4479,6 +5068,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     }
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, (new_size + auxiliary_size)/1024.0/1024.0);
+                }
             }
             total_size_org += tensor_size;
             total_size_new += new_size + auxiliary_size;
@@ -4523,7 +5113,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 }
             }
         } // no --dry-run
-    } // main loop
+    } // main loop (within try block)
+
+    } // try
+    catch (...) {
+        mgpu_finalize();
+        throw;
+    }
+
+    mgpu_finalize();
 
     if (!params->dry_run) {
         close_ofstream();

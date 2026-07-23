@@ -3137,10 +3137,14 @@ static bool nvfp4_cuda_eval_requests_parallel(
     const int request_batch_size = std::max(1, std::min(request_batch_cap, (n_requests + workers - 1) / workers));
     const bool sample_x_device = ggml_cuda_nvfp4_device_pointer(sample_x);
     const bool sample_qw_device = sample_qw != nullptr && ggml_cuda_nvfp4_device_pointer(sample_qw);
+    // Save current CUDA device so spawned eval_worker threads use it
+    int eval_saved_device = 0;
+    cudaGetDevice(&eval_saved_device);
     std::atomic<int> next_request { 0 };
     std::atomic<bool> cuda_failed { false };
 
     auto eval_worker = [&](bool private_stream) {
+        cudaSetDevice(eval_saved_device);
         auto & tls = g_nvfp4_cuda_autotune_tls;
         const size_t bytes_x = (size_t) sample_nb * QK_NVFP4 * sizeof(float);
         const size_t bytes_qw = sample_qw ? ((size_t) sample_nb * QK_NVFP4 * sizeof(float)) : 0;
@@ -4056,7 +4060,6 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
         nvfp4_cuda_tune_result * result,
         cudaStream_t stream) {
     const bool trace = nvfp4_cuda_trace_enabled();
-
     if (result) {
         result->a = NVFP4_A0;
         result->b = NVFP4_B0;
@@ -4094,18 +4097,14 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
         return false;
     }
 
-    (void) stream;
     bool input_device = ggml_cuda_nvfp4_device_pointer(x);
     bool qw_device = qw != nullptr && ggml_cuda_nvfp4_device_pointer(qw);
-    // Autotune runs entirely on a single fixed device (0); see the device
-    // scope below. Any input that lives on another GPU is invalid there, so
-    // copy device-resident inputs to host when they are not all on device 0.
-    // Inputs already on device 0 stay resident (valid on the autotune device
-    // and used by the device gather path); host inputs need no action. This
-    // avoids allocating scratch on the sample's device and keeps the tested
-    // single-device autotune path untouched. The sample is a small statistical
-    // subset, so the host copy costs negligible memory and actually frees
-    // device-side scratch on the sample's device.
+    // Multi-device autotune: use the calling thread's current CUDA device and
+    // the caller-provided stream so that multi-GPU tensor workers resolve to
+    // the correct GPU. Each GPU worker has its own thread-local scratch, so
+    // there is no device-0 scratch reuse on a non-zero GPU.
+    // When no stream is provided, fall back to the internal stream for the
+    // default device (0) as before.
     std::vector<float> x_host_copy;
     std::vector<float> qw_host_copy;
     if (input_device || qw_device) {
@@ -4150,14 +4149,12 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
         }
     }
 
-    // Autotune derives only device-independent quantization parameters, so run
-    // it on a single fixed device (0) with that device's scratch and worker
-    // stream. This avoids reusing device-0 scratch on a non-zero GPU when the
-    // caller leaves the current device pointed at another GPU (e.g. right
-    // after a multi-GPU materialization pass), which would otherwise corrupt
-    // the device context.
-    nvfp4_cuda_device_scope dev_scope(0);
-    cudaStream_t st = nvfp4_cuda_internal_stream(0);
+    // Autotune runs on the calling thread's current CUDA device and uses the
+    // caller-provided stream so that multi-GPU tensor workers resolve to the
+    // correct GPU. When no stream is provided, fall back to the internal
+    // stream for the current device.
+    nvfp4_cuda_device_scope dev_scope(-1);
+    cudaStream_t st = stream ? stream : nvfp4_cuda_internal_stream(0);
 
     std::vector<float> x_coarse_sample;
     std::vector<float> x_refine_sample;

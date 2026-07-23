@@ -52,6 +52,7 @@
 #include <thread>
 #include <utility>
 
+
 #if defined(__unix__) || defined(__APPLE__)
 #include <dlfcn.h>
 #endif
@@ -993,6 +994,7 @@ static bool quantize_run_binding_slices(
     }
     return true;
 }
+
 
 template <ggml_type type>
 static bool quantize_binding_has_target(
