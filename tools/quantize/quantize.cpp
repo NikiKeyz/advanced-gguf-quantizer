@@ -549,6 +549,7 @@ struct nvfp4_selector_device_sample_entry {
     const void * source_ptr = nullptr;
     const float * imatrix_ptr = nullptr;
     float tune_x_mul = 1.0f;
+    int device_id = -1;
     void * cache = nullptr;
     const float * x_device = nullptr;
     const float * tune_x_device = nullptr;
@@ -568,7 +569,8 @@ struct nvfp4_selector_device_sample_entry {
             int32_t type,
             const void * src,
             const float * imat,
-            float tune_mul) const {
+            float tune_mul,
+            int device) const {
         return
             slice_index == slice &&
             sample_nb == nb &&
@@ -576,6 +578,7 @@ struct nvfp4_selector_device_sample_entry {
             source_type == type &&
             source_ptr == src &&
             imatrix_ptr == imat &&
+            device_id == device &&
             std::fabs(tune_x_mul - tune_mul) <= 1e-12f * std::max(1.0f, std::max(std::fabs(tune_x_mul), std::fabs(tune_mul)));
     }
 };
@@ -973,8 +976,15 @@ static bool quantize_run_binding_slices(
     std::vector<std::thread> workers;
     std::vector<quantize_binding_slice_accum_t> accs((size_t) worker_count);
     workers.reserve((size_t) worker_count);
+#ifdef GGML_USE_CUDA
+    int parent_cuda_device = 0;
+    cudaGetDevice(&parent_cuda_device);
+#endif
     for (int wi = 0; wi < worker_count; ++wi) {
         workers.emplace_back([&, wi]() {
+#ifdef GGML_USE_CUDA
+            cudaSetDevice(parent_cuda_device);
+#endif
             void * stream_key = quantize_binding_stream_key<type>(stream_seed, wi, -1, false);
             while (accs[(size_t) wi].ok) {
                 const int64_t i03 = next_slice.fetch_add(1, std::memory_order_relaxed);
@@ -4788,9 +4798,16 @@ static bool nvfp4_selector_get_device_sample(
         ? 1.0f / quant_tensor_scale
         : 1.0f;
 
+#ifdef GGML_USE_CUDA
+    int current_device_id = 0;
+    cudaGetDevice(&current_device_id);
+#else
+    int current_device_id = 0;
+#endif
+
     std::lock_guard<std::mutex> lock(binding.device_samples->mutex);
     for (const auto & entry : binding.device_samples->entries) {
-        if (entry && entry->matches(slice_index, sample_nb, sample_phase, (int32_t) src_tensor->type, src_slice, imatrix_row, tune_x_mul)) {
+        if (entry && entry->matches(slice_index, sample_nb, sample_phase, (int32_t) src_tensor->type, src_slice, imatrix_row, tune_x_mul, current_device_id)) {
             out.x_device = entry->x_device;
             out.tune_x_device = entry->tune_x_device;
             out.qw_device = entry->qw_device;
@@ -4808,6 +4825,7 @@ static bool nvfp4_selector_get_device_sample(
     entry->source_ptr = src_slice;
     entry->imatrix_ptr = imatrix_row;
     entry->tune_x_mul = tune_x_mul;
+    entry->device_id = current_device_id;
 
     if (!nvfp4_sample_cache_cuda_create(
             src_slice,
@@ -6957,8 +6975,15 @@ static bool selector_choose_policy(
             std::atomic<size_t> next_binding{0};
             std::vector<std::thread> workers_local;
             workers_local.reserve((size_t) policy_threads);
+#ifdef GGML_USE_CUDA
+            int parent_cuda_device = 0;
+            cudaGetDevice(&parent_cuda_device);
+#endif
             for (int ti = 0; ti < policy_threads; ++ti) {
                 workers_local.emplace_back([&, ti]() {
+#ifdef GGML_USE_CUDA
+                    cudaSetDevice(parent_cuda_device);
+#endif
                     std::vector<uint8_t> tmp_bytes_local;
                     while (true) {
                         const size_t ib = next_binding.fetch_add(1, std::memory_order_relaxed);
@@ -7068,12 +7093,14 @@ static bool selector_choose_policy(
     auto score_proxy_policy_extended = [&](selector_policy & policy,
                                           const std::vector<size_t> & binding_indices,
                                           int64_t sample_blocks_override,
-                                          bool store_survey,
-                                          const char * label) -> bool {
-        restore_all();
-        nvfp4_cuda_runtime_cfg proxy_cfg = policy.cfg;
+                                           bool store_survey,
+                                           const char * label) -> bool {
         const bool materializes_full_policy = want_measured_eval && sample_blocks_override <= 0;
         const bool proxy_only = !materializes_full_policy;
+        if (!proxy_only) {
+            restore_all();
+        }
+        nvfp4_cuda_runtime_cfg proxy_cfg = policy.cfg;
         if (proxy_only &&
                 nvfp4_cfg_has_rsf(proxy_cfg) &&
                 nvfp4_cfg_rsf_depth(proxy_cfg) > NVFP4_CUDA_RSF_DEPTH_DEEP) {
@@ -7172,8 +7199,15 @@ static bool selector_choose_policy(
             std::atomic<size_t> next_binding{0};
             std::vector<std::thread> workers_local;
             workers_local.reserve((size_t) policy_threads);
+#ifdef GGML_USE_CUDA
+            int parent_cuda_device = 0;
+            cudaGetDevice(&parent_cuda_device);
+#endif
             for (int ti = 0; ti < policy_threads; ++ti) {
                 workers_local.emplace_back([&, ti]() {
+#ifdef GGML_USE_CUDA
+                    cudaSetDevice(parent_cuda_device);
+#endif
                     std::vector<uint8_t> tmp_bytes_local;
                     while (true) {
                         const size_t ib = next_binding.fetch_add(1, std::memory_order_relaxed);
@@ -7287,8 +7321,12 @@ static bool selector_choose_policy(
         return true;
     };
 
+    std::mutex reject_restore_mtx;
     auto reject_policy = [&](selector_policy & policy, const char * phase) {
-        restore_all();
+        {
+            std::lock_guard<std::mutex> lock(reject_restore_mtx);
+            restore_all();
+        }
         policy.proxy_score = std::numeric_limits<double>::infinity();
         policy.proxy_rmse = std::numeric_limits<double>::infinity();
         policy.proxy_abs_mean = std::numeric_limits<double>::infinity();
@@ -7300,15 +7338,15 @@ static bool selector_choose_policy(
             __func__, policy.name.c_str(), phase);
     };
 
-    bool skip_remaining_tuning = false;
+    std::atomic<bool> skip_remaining_tuning{false};
     auto note_skip_remaining = [&](const char * phase) {
-        if (skip_remaining_tuning) {
+        if (skip_remaining_tuning.load(std::memory_order_acquire)) {
             return true;
         }
         if (!selector_skip_requested(phase)) {
             return false;
         }
-        skip_remaining_tuning = true;
+        skip_remaining_tuning.store(true, std::memory_order_release);
         fprintf(stderr,
             "%s: selector skip requested after %s; remaining optional tuning will be skipped\n",
             __func__,
@@ -7674,21 +7712,69 @@ static bool selector_choose_policy(
             survey_dedup_skipped);
     }
     if (!skip_remaining_tuning) {
-        for (size_t survey_pos = 0; survey_pos < survey_policy_indices.size(); ++survey_pos) {
-            const size_t policy_idx = survey_policy_indices[survey_pos];
-            fprintf(stderr,
-                "selector survey start [%zu/%zu] policy=%s tensors=%zu sample_blocks=%" PRId64 "\n",
-                survey_pos + 1,
-                survey_policy_indices.size(),
-                policies[policy_idx].name.c_str(),
-                all_binding_indices.size(),
-                survey_sample_blocks);
-            if (!score_proxy_policy_extended(policies[policy_idx], all_binding_indices, survey_sample_blocks, true, "stage-a-survey")) {
-                reject_policy(policies[policy_idx], "survey");
-                continue;
-            }
-            if (note_skip_remaining("survey")) {
-                break;
+        {
+#ifdef GGML_USE_CUDA
+            const int mgpu_ndev = std::max(1, ggml_backend_cuda_get_device_count());
+            const bool mgpu_enabled = mgpu_ndev > 1 && survey_policy_indices.size() > 1;
+#else
+            const int mgpu_ndev = 1;
+            const bool mgpu_enabled = false;
+#endif
+            std::mutex survey_stderr_lock;
+            std::atomic<size_t> next_survey{0};
+            auto survey_worker = [&](int di) -> void {
+#ifdef GGML_USE_CUDA
+                if (mgpu_enabled) {
+                    cudaSetDevice(di);
+                }
+#endif
+                while (true) {
+                    const size_t survey_pos = next_survey.fetch_add(1, std::memory_order_relaxed);
+                    if (survey_pos >= survey_policy_indices.size()) {
+                        break;
+                    }
+                    const size_t policy_idx = survey_policy_indices[survey_pos];
+                    {
+                        std::lock_guard<std::mutex> lock(survey_stderr_lock);
+                        if (mgpu_enabled) {
+                            fprintf(stderr,
+                                "selector survey start [%zu/%zu] policy=%s tensors=%zu sample_blocks=%" PRId64 " gpu=%d\n",
+                                survey_pos + 1,
+                                survey_policy_indices.size(),
+                                policies[policy_idx].name.c_str(),
+                                all_binding_indices.size(),
+                                survey_sample_blocks,
+                                di);
+                        } else {
+                            fprintf(stderr,
+                                "selector survey start [%zu/%zu] policy=%s tensors=%zu sample_blocks=%" PRId64 "\n",
+                                survey_pos + 1,
+                                survey_policy_indices.size(),
+                                policies[policy_idx].name.c_str(),
+                                all_binding_indices.size(),
+                                survey_sample_blocks);
+                        }
+                    }
+                    if (!score_proxy_policy_extended(policies[policy_idx], all_binding_indices, survey_sample_blocks, true, "stage-a-survey")) {
+                        reject_policy(policies[policy_idx], "survey");
+                        continue;
+                    }
+                    if (note_skip_remaining("survey")) {
+                        break;
+                    }
+                }
+            };
+            if (mgpu_enabled) {
+                std::vector<std::thread> workers;
+                workers.reserve((size_t) mgpu_ndev);
+                for (int di = 0; di < mgpu_ndev; ++di) {
+                    workers.emplace_back(survey_worker, di);
+                }
+                for (auto & w : workers) {
+                    w.join();
+                }
+            } else {
+                survey_worker(0);
             }
         }
     }
