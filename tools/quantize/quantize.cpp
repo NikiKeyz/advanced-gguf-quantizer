@@ -10456,113 +10456,159 @@ static bool selector_choose_policy(
         std::vector<selector_tensor_sensitivity> sens;
         sens.reserve(all_bindings.size());
         selector_log_rss("sens-loop-start");
-        for (size_t bind_i = 0; bind_i < all_bindings.size(); ++bind_i) {
-            auto & b = all_bindings[bind_i];
-            if (selector_trace) {
-                fprintf(stderr,
-                    "selector sensitivity [%zu/%zu] tensor=%s cls=%s bucket=%d layer=%d\n",
-                    bind_i + 1,
-                    all_bindings.size(),
-                    b.name.c_str(),
-                    selector_tensor_class_name(b.cls),
-                    b.bucket,
-                    b.layer);
+#ifdef GGML_USE_CUDA
+        const int sens_ndev = std::max(1, ggml_backend_cuda_get_device_count());
+        const bool sens_mgpu = sens_ndev > 1 && all_bindings.size() > 1;
+#else
+        const int sens_ndev = 1;
+        const bool sens_mgpu = false;
+#endif
+        std::mutex sens_mtx;
+        std::mutex sens_log_mtx;
+        std::atomic<size_t> sens_next{0};
+        std::atomic<size_t> sens_done{0};
+        auto sens_worker = [&](int sens_di) {
+#ifdef GGML_USE_CUDA
+            if (sens_mgpu) {
+                cudaSetDevice(sens_di);
             }
-            double tensor_sq = 0.0;
-            double tensor_abs = 0.0;
-            double tensor_max = 0.0;
-            int64_t tensor_n = 0;
-            std::vector<uint8_t> sens_bytes;
-            const selector_policy * tensor_base_policy = tensor_plan_policy_for_binding(b);
-            if (!nvfp4_selector_quantize_binding(
-                    b, tensor_base_policy->cfg, nthread, sens_bytes,
-                    tensor_sq, tensor_abs, tensor_max, tensor_n,
-                    candidate_sens_sample_blocks) || tensor_n <= 0) {
-                continue;
-            }
-            selector_tensor_sensitivity s;
-            s.name = b.name;
-            s.role = selector_tensor_role_name(b.name, b.cls);
-            s.cls = b.cls;
-            s.bucket = b.bucket;
-            s.layer = b.layer;
-            s.binding_index = &b - all_bindings.data();
-            s.target_nbytes = b.target_nbytes;
-            s.best_candidate_type = candidate_types.empty() ? GGML_TYPE_Q8_0 : candidate_types.front();
-            s.best_candidate_nbytes = quantize_tensor_nbytes_as_type(b.source, s.best_candidate_type);
-            s.bf16_nbytes = quantize_tensor_nbytes_as_type(b.source, GGML_TYPE_BF16);
-            const selector_proxy_metrics proxy_metrics =
-                selector_proxy_score(tensor_sq, tensor_abs, tensor_max, tensor_n);
-            if (!proxy_metrics.ok) {
-                continue;
-            }
-            s.proxy_rmse = proxy_metrics.rmse;
-            s.proxy_abs_mean = proxy_metrics.abs_mean;
-            s.proxy_max_abs = proxy_metrics.max_abs;
-            s.proxy_score = proxy_metrics.score;
-            if (selector_trace) {
-                fprintf(stderr,
-                    "selector sensitivity result [%zu/%zu] tensor=%s baseline_error=%.6f rmse=%.6f abs=%.6f max=%.6f samples=%" PRId64 "\n",
-                    bind_i + 1,
-                    all_bindings.size(),
-                    b.name.c_str(),
-                    s.proxy_score,
-                    s.proxy_rmse,
-                    s.proxy_abs_mean,
-                    s.proxy_max_abs,
-                    tensor_n);
-            }
-            s.best_candidate_delta_bytes = s.best_candidate_nbytes > s.target_nbytes ? s.best_candidate_nbytes - s.target_nbytes : 0;
-            s.bf16_delta_bytes = s.bf16_nbytes > s.target_nbytes ? s.bf16_nbytes - s.target_nbytes : 0;
-            const double hotness = selector_class_hotness(b.cls);
-            for (const ggml_type candidate_type : candidate_types) {
-                if (!selector_type_candidate_allowed(candidate_type, s.cls)) {
+#endif
+            while (true) {
+                const size_t bind_i = sens_next.fetch_add(1, std::memory_order_relaxed);
+                if (bind_i >= all_bindings.size()) {
+                    break;
+                }
+                auto & b = all_bindings[bind_i];
+#ifdef GGML_USE_CUDA
+                if (sens_mgpu && b.target_device >= 0) {
+                    cudaSetDevice(b.target_device);
+                }
+#endif
+                if (selector_trace) {
+                    std::lock_guard<std::mutex> lock(sens_log_mtx);
+                    fprintf(stderr,
+                        "selector sensitivity [%zu/%zu] tensor=%s cls=%s bucket=%d layer=%d\n",
+                        bind_i + 1,
+                        all_bindings.size(),
+                        b.name.c_str(),
+                        selector_tensor_class_name(b.cls),
+                        b.bucket,
+                        b.layer);
+                }
+                double tensor_sq = 0.0;
+                double tensor_abs = 0.0;
+                double tensor_max = 0.0;
+                int64_t tensor_n = 0;
+                std::vector<uint8_t> sens_bytes;
+                const selector_policy * tensor_base_policy = tensor_plan_policy_for_binding(b);
+                if (!nvfp4_selector_quantize_binding(
+                        b, tensor_base_policy->cfg, nthread, sens_bytes,
+                        tensor_sq, tensor_abs, tensor_max, tensor_n,
+                        candidate_sens_sample_blocks) || tensor_n <= 0) {
                     continue;
                 }
-                selector_type_candidate cand;
-                cand.type = candidate_type;
-                cand.nbytes = quantize_tensor_nbytes_as_type(b.source, candidate_type);
-                if (cand.nbytes == 0) {
+                selector_tensor_sensitivity s;
+                s.name = b.name;
+                s.role = selector_tensor_role_name(b.name, b.cls);
+                s.cls = b.cls;
+                s.bucket = b.bucket;
+                s.layer = b.layer;
+                s.binding_index = &b - all_bindings.data();
+                s.target_nbytes = b.target_nbytes;
+                s.best_candidate_type = candidate_types.empty() ? GGML_TYPE_Q8_0 : candidate_types.front();
+                s.best_candidate_nbytes = quantize_tensor_nbytes_as_type(b.source, s.best_candidate_type);
+                s.bf16_nbytes = quantize_tensor_nbytes_as_type(b.source, GGML_TYPE_BF16);
+                const selector_proxy_metrics proxy_metrics =
+                    selector_proxy_score(tensor_sq, tensor_abs, tensor_max, tensor_n);
+                if (!proxy_metrics.ok) {
                     continue;
                 }
-                cand.delta_bytes = cand.nbytes > s.target_nbytes ? cand.nbytes - s.target_nbytes : 0;
-                cand.speed_penalty = hotness * selector_type_speed_penalty(candidate_type);
-                cand.type_gain = selector_tensor_role_type_gain(b.name, b.cls, candidate_type);
-                cand.roi = selector_type_candidate_roi(
+                s.proxy_rmse = proxy_metrics.rmse;
+                s.proxy_abs_mean = proxy_metrics.abs_mean;
+                s.proxy_max_abs = proxy_metrics.max_abs;
+                s.proxy_score = proxy_metrics.score;
+                if (selector_trace) {
+                    std::lock_guard<std::mutex> lock(sens_log_mtx);
+                    fprintf(stderr,
+                        "selector sensitivity result [%zu/%zu] tensor=%s baseline_error=%.6f rmse=%.6f abs=%.6f max=%.6f samples=%" PRId64 "\n",
+                        bind_i + 1,
+                        all_bindings.size(),
+                        b.name.c_str(),
+                        s.proxy_score,
+                        s.proxy_rmse,
+                        s.proxy_abs_mean,
+                        s.proxy_max_abs,
+                        tensor_n);
+                }
+                s.best_candidate_delta_bytes = s.best_candidate_nbytes > s.target_nbytes ? s.best_candidate_nbytes - s.target_nbytes : 0;
+                s.bf16_delta_bytes = s.bf16_nbytes > s.target_nbytes ? s.bf16_nbytes - s.target_nbytes : 0;
+                const double hotness = selector_class_hotness(b.cls);
+                for (const ggml_type candidate_type : candidate_types) {
+                    if (!selector_type_candidate_allowed(candidate_type, s.cls)) {
+                        continue;
+                    }
+                    selector_type_candidate cand;
+                    cand.type = candidate_type;
+                    cand.nbytes = quantize_tensor_nbytes_as_type(b.source, candidate_type);
+                    if (cand.nbytes == 0) {
+                        continue;
+                    }
+                    cand.delta_bytes = cand.nbytes > s.target_nbytes ? cand.nbytes - s.target_nbytes : 0;
+                    cand.speed_penalty = hotness * selector_type_speed_penalty(candidate_type);
+                    cand.type_gain = selector_tensor_role_type_gain(b.name, b.cls, candidate_type);
+                    cand.roi = selector_type_candidate_roi(
+                        s.proxy_score,
+                        cand.delta_bytes,
+                        cand.speed_penalty,
+                        cand.type_gain,
+                        rescue_speed_weight);
+                    s.type_candidates.push_back(cand);
+                }
+                std::sort(s.type_candidates.begin(), s.type_candidates.end(), [](const auto & a, const auto & b) {
+                    if (a.roi != b.roi) return a.roi > b.roi;
+                    if (a.speed_penalty != b.speed_penalty) return a.speed_penalty < b.speed_penalty;
+                    if (a.delta_bytes != b.delta_bytes) return a.delta_bytes < b.delta_bytes;
+                    return (int) a.type < (int) b.type;
+                });
+                if (!s.type_candidates.empty()) {
+                    const auto & best_candidate = s.type_candidates.front();
+                    s.best_candidate_type = best_candidate.type;
+                    s.best_candidate_nbytes = best_candidate.nbytes;
+                    s.best_candidate_delta_bytes = best_candidate.delta_bytes;
+                    s.best_candidate_speed_penalty = best_candidate.speed_penalty;
+                    s.best_candidate_roi = best_candidate.roi;
+                }
+                s.bf16_speed_penalty = hotness * selector_type_speed_penalty(GGML_TYPE_BF16);
+                s.bf16_roi = selector_type_candidate_roi(
                     s.proxy_score,
-                    cand.delta_bytes,
-                    cand.speed_penalty,
-                    cand.type_gain,
+                    s.bf16_delta_bytes,
+                    s.bf16_speed_penalty,
+                    selector_type_quality_gain(GGML_TYPE_BF16),
                     rescue_speed_weight);
-                s.type_candidates.push_back(cand);
+                {
+                    std::lock_guard<std::mutex> lock(sens_mtx);
+                    sens.push_back(std::move(s));
+                }
+                const size_t done = sens_done.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((done & 63) == 0 || done == all_bindings.size()) {
+                    std::lock_guard<std::mutex> lock(sens_log_mtx);
+                    char label[64];
+                    snprintf(label, sizeof(label), "sens-loop-%zu/%zu", done, all_bindings.size());
+                    selector_log_rss(label);
+                }
             }
-            std::sort(s.type_candidates.begin(), s.type_candidates.end(), [](const auto & a, const auto & b) {
-                if (a.roi != b.roi) return a.roi > b.roi;
-                if (a.speed_penalty != b.speed_penalty) return a.speed_penalty < b.speed_penalty;
-                if (a.delta_bytes != b.delta_bytes) return a.delta_bytes < b.delta_bytes;
-                return (int) a.type < (int) b.type;
-            });
-            if (!s.type_candidates.empty()) {
-                const auto & best_candidate = s.type_candidates.front();
-                s.best_candidate_type = best_candidate.type;
-                s.best_candidate_nbytes = best_candidate.nbytes;
-                s.best_candidate_delta_bytes = best_candidate.delta_bytes;
-                s.best_candidate_speed_penalty = best_candidate.speed_penalty;
-                s.best_candidate_roi = best_candidate.roi;
+        };
+        if (sens_mgpu) {
+            std::vector<std::thread> workers;
+            workers.reserve((size_t) sens_ndev);
+            for (int di = 0; di < sens_ndev; ++di) {
+                workers.emplace_back(sens_worker, di);
             }
-            s.bf16_speed_penalty = hotness * selector_type_speed_penalty(GGML_TYPE_BF16);
-            s.bf16_roi = selector_type_candidate_roi(
-                s.proxy_score,
-                s.bf16_delta_bytes,
-                s.bf16_speed_penalty,
-                selector_type_quality_gain(GGML_TYPE_BF16),
-                rescue_speed_weight);
-            sens.push_back(std::move(s));
-            if ((bind_i & 63) == 0 || bind_i + 1 == all_bindings.size()) {
-                char label[64];
-                snprintf(label, sizeof(label), "sens-loop-%zu/%zu", bind_i + 1, all_bindings.size());
-                selector_log_rss(label);
+            for (auto & w : workers) {
+                w.join();
             }
+        } else {
+            sens_worker(0);
         }
 
         std::sort(sens.begin(), sens.end(), [](const auto & a, const auto & b) {
@@ -10621,96 +10667,147 @@ static bool selector_choose_policy(
             full_quant_eta.update(clamped_done, candidate_scan_n, detail, print_now);
         };
         update_candidate_scan_eta(0, true);
-        for (int i = 0; i < candidate_scan_n; ++i) {
-            selector_log_rss(("scan-tensor-" + std::to_string(i) + "-start").c_str());
-            auto & s = sens[(size_t) i];
-            auto & b = all_bindings[s.binding_index];
-            const selector_policy * tensor_base_policy = tensor_plan_policy_for_binding(b);
-            if (selector_trace) {
-                fprintf(stderr,
-                    "selector candidate scan [%d/%d] tensor=%s role=%s cls=%s bucket=%d layer=%d baseline_error=%.6f\n",
-                    i + 1,
-                    candidate_scan_n,
-                    s.name.c_str(),
-                    s.role.c_str(),
-                    selector_tensor_class_name(s.cls),
-                    s.bucket,
-                    s.layer,
-                    s.proxy_score);
+#ifdef GGML_USE_CUDA
+        const int rescue_ndev = std::max(1, ggml_backend_cuda_get_device_count());
+        const bool rescue_mgpu = rescue_ndev > 1 && candidate_scan_n > 1;
+#else
+        const int rescue_ndev = 1;
+        const bool rescue_mgpu = false;
+#endif
+        std::mutex rescue_cache_mtx;
+        std::mutex rescue_log_mtx;
+        std::atomic<int> rescue_next{0};
+        std::atomic<int> rescue_done{0};
+        auto rescue_worker = [&](int rescue_di) {
+#ifdef GGML_USE_CUDA
+            if (rescue_mgpu) {
+                cudaSetDevice(rescue_di);
             }
-            nvfp4_cuda_runtime_cfg alt_cfg = tensor_base_policy->cfg;
-            std::string alt_policy_name;
-            int64_t alt_sample_blocks = 0;
-            double base_score = std::numeric_limits<double>::infinity();
-            double best_score = std::numeric_limits<double>::infinity();
-            const int64_t rescue_nb_total =
-                (b.source->ne[0] * b.source->ne[1]) / SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
-            const int64_t rescue_sample_blocks =
-                selector_rescue_sample_blocks(rescue_nb_total, b.cls);
-            const int64_t rescue_refine_blocks =
-                selector_rescue_refine_blocks(rescue_nb_total, b.cls, rescue_sample_blocks);
-            const int64_t rescue_guard_blocks =
-                selector_rescue_guard_blocks(rescue_nb_total, b.cls, rescue_refine_blocks);
-            const nlohmann::ordered_json tensor_rescue_key = make_tensor_rescue_key(
-                b,
-                tensor_base_policy->cfg,
-                rescue_sample_blocks,
-                rescue_refine_blocks,
-                rescue_guard_blocks);
-            selector_tensor_rescue_cache_entry cached_rescue;
-            bool rescue_ok = false;
-            if (tensor_rescue_cache.find(tensor_rescue_key, s.name, cached_rescue)) {
-                alt_cfg = cached_rescue.cfg;
-                alt_policy_name = cached_rescue.policy;
-                alt_sample_blocks = cached_rescue.sample_blocks;
-                base_score = cached_rescue.base_score;
-                best_score = cached_rescue.best_score;
-                rescue_ok = true;
-            } else {
-                rescue_ok = selector_find_tensor_rescue_cfg(
+#endif
+            while (true) {
+                const int i = rescue_next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= candidate_scan_n) {
+                    break;
+                }
+                auto & s = sens[(size_t) i];
+                auto & b = all_bindings[s.binding_index];
+#ifdef GGML_USE_CUDA
+                if (rescue_mgpu && b.target_device >= 0) {
+                    cudaSetDevice(b.target_device);
+                }
+#endif
+                const selector_policy * tensor_base_policy = tensor_plan_policy_for_binding(b);
+                if (selector_trace) {
+                    std::lock_guard<std::mutex> lock(rescue_log_mtx);
+                    fprintf(stderr,
+                        "selector candidate scan [%d/%d] tensor=%s role=%s cls=%s bucket=%d layer=%d baseline_error=%.6f\n",
+                        i + 1,
+                        candidate_scan_n,
+                        s.name.c_str(),
+                        s.role.c_str(),
+                        selector_tensor_class_name(s.cls),
+                        s.bucket,
+                        s.layer,
+                        s.proxy_score);
+                }
+                nvfp4_cuda_runtime_cfg alt_cfg = tensor_base_policy->cfg;
+                std::string alt_policy_name;
+                int64_t alt_sample_blocks = 0;
+                double base_score = std::numeric_limits<double>::infinity();
+                double best_score = std::numeric_limits<double>::infinity();
+                const int64_t rescue_nb_total =
+                    (b.source->ne[0] * b.source->ne[1]) / SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
+                const int64_t rescue_sample_blocks =
+                    selector_rescue_sample_blocks(rescue_nb_total, b.cls);
+                const int64_t rescue_refine_blocks =
+                    selector_rescue_refine_blocks(rescue_nb_total, b.cls, rescue_sample_blocks);
+                const int64_t rescue_guard_blocks =
+                    selector_rescue_guard_blocks(rescue_nb_total, b.cls, rescue_refine_blocks);
+                const nlohmann::ordered_json tensor_rescue_key = make_tensor_rescue_key(
                     b,
                     tensor_base_policy->cfg,
-                    nthread,
-                    alt_cfg,
-                    alt_policy_name,
-                    alt_sample_blocks,
-                    base_score,
-                    best_score);
-                if (rescue_ok) {
-                    selector_tensor_rescue_cache_entry rescue_entry;
-                    rescue_entry.policy = alt_policy_name;
-                    rescue_entry.cfg = alt_cfg;
-                    rescue_entry.sample_blocks = alt_sample_blocks;
-                    rescue_entry.base_score = base_score;
-                    rescue_entry.best_score = best_score;
-                    tensor_rescue_cache.append(tensor_rescue_key, s.name, rescue_entry);
+                    rescue_sample_blocks,
+                    rescue_refine_blocks,
+                    rescue_guard_blocks);
+                selector_tensor_rescue_cache_entry cached_rescue;
+                bool rescue_ok = false;
+                {
+                    std::lock_guard<std::mutex> lock(rescue_cache_mtx);
+                    if (tensor_rescue_cache.find(tensor_rescue_key, s.name, cached_rescue)) {
+                        alt_cfg = cached_rescue.cfg;
+                        alt_policy_name = cached_rescue.policy;
+                        alt_sample_blocks = cached_rescue.sample_blocks;
+                        base_score = cached_rescue.base_score;
+                        best_score = cached_rescue.best_score;
+                        rescue_ok = true;
+                    }
                 }
-            }
-            if (!rescue_ok) {
-                continue;
-            }
+                if (!rescue_ok) {
+                    rescue_ok = selector_find_tensor_rescue_cfg(
+                        b,
+                        tensor_base_policy->cfg,
+                        nthread,
+                        alt_cfg,
+                        alt_policy_name,
+                        alt_sample_blocks,
+                        base_score,
+                        best_score);
+                    if (rescue_ok) {
+                        selector_tensor_rescue_cache_entry rescue_entry;
+                        rescue_entry.policy = alt_policy_name;
+                        rescue_entry.cfg = alt_cfg;
+                        rescue_entry.sample_blocks = alt_sample_blocks;
+                        rescue_entry.base_score = base_score;
+                        rescue_entry.best_score = best_score;
+                        {
+                            std::lock_guard<std::mutex> lock(rescue_cache_mtx);
+                            tensor_rescue_cache.append(tensor_rescue_key, s.name, rescue_entry);
+                        }
+                    }
+                }
+                if (!rescue_ok) {
+                    continue;
+                }
 
-            s.alt_nvfp4_encoder_proxy_score = best_score;
-            s.alt_nvfp4_encoder_gain = std::max(0.0, base_score - best_score);
-            s.alt_nvfp4_encoder_gain_rel = s.alt_nvfp4_encoder_gain / std::max(1e-9, base_score);
-            if ((s.alt_nvfp4_encoder_gain >= rescue_nvfp4_min_gain || s.alt_nvfp4_encoder_gain_rel >= rescue_nvfp4_min_rel_gain) &&
-                !selector_cfg_equal(alt_cfg, tensor_base_policy->cfg)) {
-                s.has_alt_nvfp4_encoder_cfg = true;
-                s.alt_nvfp4_encoder_cfg = alt_cfg;
-                s.alt_nvfp4_encoder_sample_blocks = alt_sample_blocks;
-                s.alt_nvfp4_encoder_policy_name = alt_policy_name;
-                if (selector_trace) {
-                    fprintf(stderr,
-                        "selector candidate alt tensor=%s policy=%s gain=%.6f rel=%.4f sample_blocks=%" PRId64 "\n",
-                        s.name.c_str(),
-                        s.alt_nvfp4_encoder_policy_name.c_str(),
-                    s.alt_nvfp4_encoder_gain,
-                    s.alt_nvfp4_encoder_gain_rel,
-                    s.alt_nvfp4_encoder_sample_blocks);
+                s.alt_nvfp4_encoder_proxy_score = best_score;
+                s.alt_nvfp4_encoder_gain = std::max(0.0, base_score - best_score);
+                s.alt_nvfp4_encoder_gain_rel = s.alt_nvfp4_encoder_gain / std::max(1e-9, base_score);
+                if ((s.alt_nvfp4_encoder_gain >= rescue_nvfp4_min_gain || s.alt_nvfp4_encoder_gain_rel >= rescue_nvfp4_min_rel_gain) &&
+                    !selector_cfg_equal(alt_cfg, tensor_base_policy->cfg)) {
+                    s.has_alt_nvfp4_encoder_cfg = true;
+                    s.alt_nvfp4_encoder_cfg = alt_cfg;
+                    s.alt_nvfp4_encoder_sample_blocks = alt_sample_blocks;
+                    s.alt_nvfp4_encoder_policy_name = alt_policy_name;
+                    if (selector_trace) {
+                        std::lock_guard<std::mutex> lock(rescue_log_mtx);
+                        fprintf(stderr,
+                            "selector candidate alt tensor=%s policy=%s gain=%.6f rel=%.4f sample_blocks=%" PRId64 "\n",
+                            s.name.c_str(),
+                            s.alt_nvfp4_encoder_policy_name.c_str(),
+                        s.alt_nvfp4_encoder_gain,
+                        s.alt_nvfp4_encoder_gain_rel,
+                        s.alt_nvfp4_encoder_sample_blocks);
+                    }
+                }
+                const int done = rescue_done.fetch_add(1, std::memory_order_relaxed) + 1;
+                update_candidate_scan_eta(done, done >= candidate_scan_n);
+                if ((done & 15) == 0 || done >= candidate_scan_n) {
+                    std::lock_guard<std::mutex> lock(rescue_log_mtx);
+                    selector_log_rss(("scan-tensor-" + std::to_string(done) + "-end").c_str());
                 }
             }
-            update_candidate_scan_eta(i + 1, i + 1 == candidate_scan_n);
-            selector_log_rss(("scan-tensor-" + std::to_string(i) + "-end").c_str());
+        };
+        if (rescue_mgpu) {
+            std::vector<std::thread> workers;
+            workers.reserve((size_t) rescue_ndev);
+            for (int di = 0; di < rescue_ndev; ++di) {
+                workers.emplace_back(rescue_worker, di);
+            }
+            for (auto & w : workers) {
+                w.join();
+            }
+        } else {
+            rescue_worker(0);
         }
         selector_log_rss("scan-done");
 
