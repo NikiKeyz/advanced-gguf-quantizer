@@ -8047,13 +8047,9 @@ static bool selector_choose_policy(
         key["validation_kld"] = holdout_budget ? selector_stageb_kld_json(*holdout_budget) : nlohmann::ordered_json(nullptr);
         key["eval"] = {
             {"chunks", kld_budget.n_chunk},
-            {"n_seq", selector_n_seq},
             {"n_ctx", params.n_ctx},
             {"n_batch", params.n_batch},
             {"n_ubatch", params.n_ubatch},
-            {"n_gpu_layers", params.n_gpu_layers},
-            {"tensor_split", selector_control_string("TENSOR_SPLIT", "")},
-            {"verbosity", selector_control_string("VERBOSITY", "")},
             {"input_scale_policy", nvfp4_input_scale_policy},
         };
         key["encoder"] = {
